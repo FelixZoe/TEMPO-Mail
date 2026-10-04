@@ -230,6 +230,15 @@ const zh: Record<string, string> = {
   addresses: '地址',
   provider: '提供商',
   providers: '提供商',
+  Overview: '概览',
+  'Server Settings': '服务器设置',
+  'Mail Server': '邮件服务器',
+  'Account Management': '账户管理',
+  'Directory Management': '目录管理',
+  'Message Queue': '邮件队列',
+  Troubleshooting: '故障排查',
+  Maintenance: '维护',
+  Monitoring: '监控',
 };
 
 const phrases: Array<[RegExp, string]> = [
@@ -358,6 +367,7 @@ const translatableKeys = new Set([
   'valueLabel',
   'helpText',
   'placeholder',
+  'explanation',
 ]);
 
 const technicalOnly = /^(?:[A-Z0-9][A-Z0-9 .&/+_-]*|https?:\/\/|[a-z0-9_.-]+@[a-z0-9_.-]+)$/;
@@ -395,6 +405,73 @@ function translateValue(value: unknown, key = ''): unknown {
   return value;
 }
 
+function translateLayoutItem(item: unknown): unknown {
+  if (!item || typeof item !== 'object') return item;
+
+  const record = item as Record<string, unknown>;
+  if (record.container && typeof record.container === 'object') {
+    const container = record.container as Record<string, unknown>;
+    return {
+      ...record,
+      container: {
+        ...container,
+        name: typeof container.name === 'string' ? translateText(container.name, 'name') : container.name,
+        items: Array.isArray(container.items) ? container.items.map(translateLayoutItem) : container.items,
+      },
+    };
+  }
+
+  if (record.link && typeof record.link === 'object') {
+    const link = record.link as Record<string, unknown>;
+    return {
+      ...record,
+      link: {
+        ...link,
+        name: typeof link.name === 'string' ? translateText(link.name, 'name') : link.name,
+      },
+    };
+  }
+
+  if (record.type === 'container') {
+    return {
+      ...record,
+      name: typeof record.name === 'string' ? translateText(record.name, 'name') : record.name,
+      items: Array.isArray(record.items) ? record.items.map(translateLayoutItem) : record.items,
+    };
+  }
+
+  if (record.type === 'link') {
+    return {
+      ...record,
+      name: typeof record.name === 'string' ? translateText(record.name, 'name') : record.name,
+    };
+  }
+
+  return record;
+}
+
+function translateLayouts(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((layout) => {
+    if (!layout || typeof layout !== 'object') return layout;
+    const record = layout as Record<string, unknown>;
+    return {
+      ...record,
+      name: typeof record.name === 'string' ? translateText(record.name, 'name') : record.name,
+      items: Array.isArray(record.items) ? record.items.map(translateLayoutItem) : record.items,
+    };
+  });
+}
+
 export function localizeSchemaZh<T>(schema: T): T {
-  return translateValue(schema) as T;
+  const localized = translateValue(schema);
+  if (!localized || typeof localized !== 'object' || Array.isArray(localized)) return localized as T;
+
+  const record = localized as Record<string, unknown>;
+  return {
+    ...record,
+    // Layout `name` values are user-facing navigation copy. Other `name`
+    // fields are identifiers and must remain untouched for API compatibility.
+    layouts: translateLayouts(record.layouts),
+  } as T;
 }
