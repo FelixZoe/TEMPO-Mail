@@ -5,6 +5,8 @@
  */
 
 import { lazy, Suspense, useEffect, type ComponentType, type ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { useSchemaStore } from '@/stores/schemaStore';
 import { useCacheStore } from '@/stores/cacheStore';
 import { useAccountStore } from '@/stores/accountStore';
@@ -47,6 +49,7 @@ interface MainContentProps {
 }
 
 export function MainContent({ viewName, id, section }: MainContentProps) {
+  const { t } = useTranslation();
   const schema = useSchemaStore((s) => s.schema);
   const invalidateAllObjectLists = useCacheStore((s) => s.invalidateAllObjectLists);
 
@@ -54,10 +57,16 @@ export function MainContent({ viewName, id, section }: MainContentProps) {
     invalidateAllObjectLists();
   }, [viewName, invalidateAllObjectLists]);
 
-  return <Suspense fallback={<LoadingFallback />}>{renderView(schema, viewName, id, section)}</Suspense>;
+  return <Suspense fallback={<LoadingFallback />}>{renderView(schema, viewName, id, section, t)}</Suspense>;
 }
 
-function renderView(schema: Schema | null, viewName?: string, id?: string, section?: string): ReactNode {
+function renderView(
+  schema: Schema | null,
+  viewName: string | undefined,
+  id: string | undefined,
+  section: string | undefined,
+  t: TFunction,
+): ReactNode {
   if (!viewName) {
     return <LoadingFallback />;
   }
@@ -81,18 +90,22 @@ function renderView(schema: Schema | null, viewName?: string, id?: string, secti
     }
     return (
       <div className="rounded-lg border border-dashed p-12 text-center text-muted-foreground">
-        Unknown component: {componentName}
+        {t('errors.unknownComponent', 'Unknown component: {{name}}', { name: componentName })}
       </div>
     );
   }
 
   if (!schema) {
-    return <div className="flex items-center justify-center p-8 text-muted-foreground">Loading...</div>;
+    return <div className="flex items-center justify-center p-8 text-muted-foreground">{t('common.loading')}</div>;
   }
 
   const resolved = resolveObject(schema, viewName);
   if (!resolved) {
-    return <div className="flex items-center justify-center p-8 text-destructive">Unknown view: {viewName}</div>;
+    return (
+      <div className="flex items-center justify-center p-8 text-destructive">
+        {t('errors.unknownView', 'Unknown view: {{name}}', { name: viewName })}
+      </div>
+    );
   }
 
   if (resolved.objectName === 'x:Action') {

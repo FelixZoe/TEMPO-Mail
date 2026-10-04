@@ -56,6 +56,7 @@
     "from": "来自",
     "liveMetricsDisconnected": "实时指标流在多次重试后断开连接。",
     "liveMetricsFailed": "无法连接到实时指标。",
+    "noConfigured": "尚未配置仪表盘。",
     "preset24h": "过去 24 小时",
     "preset30d": "过去 30 天",
     "preset7d": "过去 7 天",
@@ -145,9 +146,11 @@
   },
   "errors": {
     "unexpectedError": "发生意外错误。",
+    "unknownComponent": "未知组件：{{name}}",
+    "unknownView": "未知视图：{{name}}",
     "viewNotFound": "找不到视图",
     "loadSchemaFailed": "无法加载管理面板配置。",
-    "notFound": "请求的资源不存在找到。"
+    "notFound": "找不到请求的资源。"
   },
   "expression": {
     "addCondition": "添加条件",
@@ -162,7 +165,7 @@
   "field": {
     "add": "添加",
     "addItem": "添加项目",
-    "contentModified": "修改内容（将另存为新内容） blob)",
+    "contentModified": "内容已修改（将另存为新的数据对象）",
     "enable": "启用",
     "key": "键...",
     "loadingContent": "正在加载内容...",
@@ -178,6 +181,7 @@
     "selectOptions": "选择选项...",
     "time": "时间",
     "type": "类型",
+    "unsupported": "不支持的字段类型",
     "typeAndPressEnter": "输入后按回车键…",
     "unknownObjectType": "未知对象类型： {{name}}"
   },
@@ -277,6 +281,7 @@
     "filters": "筛选",
     "massAction": "操作",
     "next": "下一页",
+    "noConfigured": "尚未配置列表",
     "noResults": "未找到结果",
     "previous": "上一页",
     "resetFilters": "重置",
@@ -378,7 +383,7 @@
     "traceNotFound": "找不到跟踪",
     "valuePlaceholder": "值..."
   },
-  "tryEnterprise": "尝试 Enterprise",
+  "tryEnterprise": "试用企业版",
   "userMenu": "用户菜单",
   "view": {
     "couldNotResolve": "无法解析对象",

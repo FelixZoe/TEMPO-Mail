@@ -5,6 +5,7 @@
  */
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
 import { ChevronsUpDown, Check, X } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
@@ -39,16 +40,21 @@ export function Combobox({
   options,
   value,
   onValueChange,
-  placeholder = 'Select...',
-  searchPlaceholder = 'Search...',
-  emptyText = 'No matches.',
+  placeholder: placeholderProp,
+  searchPlaceholder: searchPlaceholderProp,
+  emptyText: emptyTextProp,
   disabled,
   contentClassName,
   nullable,
-  nullLabel = 'None',
+  nullLabel: nullLabelProp,
   onFirstOpen,
   className,
 }: ComboboxProps) {
+  const { t } = useTranslation();
+  const placeholder = placeholderProp ?? t('field.selectEllipsis', 'Select...');
+  const searchPlaceholder = searchPlaceholderProp ?? t('common.searchPlaceholder', 'Search...');
+  const emptyText = emptyTextProp ?? t('field.noMatches', 'No matches.');
+  const nullLabel = nullLabelProp ?? t('field.none', 'None');
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [triggerWidth, setTriggerWidth] = useState<number | undefined>(undefined);

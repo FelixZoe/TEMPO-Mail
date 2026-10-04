@@ -201,7 +201,7 @@ export function FieldWidget(props: FieldWidgetProps) {
       default: {
         const _: never = ft;
         void _;
-        return <p className="text-sm text-muted-foreground">Unsupported field type</p>;
+        return <p className="text-sm text-muted-foreground">{t('field.unsupported', 'Unsupported field type')}</p>;
       }
     }
   })();
@@ -319,6 +319,7 @@ function StringField({
   maxLength,
   nullable,
 }: StringFieldProps) {
+  const { t } = useTranslation();
   const strValue = (value as string) ?? '';
 
   const handleCommit = (v: string) => {
@@ -331,7 +332,7 @@ function StringField({
 
   if (readOnly && format !== 'secret' && format !== 'secretText' && format !== 'color') {
     if (!strValue) {
-      return <span className="text-sm text-muted-foreground italic">Not set</span>;
+      return <span className="text-sm text-muted-foreground italic">{t('field.notSet', 'Not set')}</span>;
     }
     if (format === 'text' || format === 'html') {
       return (
@@ -560,10 +561,11 @@ interface NumberFieldProps {
 }
 
 function NumberField({ format, value, onChange, readOnly, min, max, nullable }: NumberFieldProps) {
+  const { t } = useTranslation();
   if (readOnly && format !== 'size' && format !== 'duration') {
     const numValue = value as number | null | undefined;
     if (numValue == null) {
-      return <span className="text-sm text-muted-foreground italic">Not set</span>;
+      return <span className="text-sm text-muted-foreground italic">{t('field.notSet', 'Not set')}</span>;
     }
     return <span className="text-sm">{numValue.toLocaleString()}</span>;
   }

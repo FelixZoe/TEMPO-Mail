@@ -6,6 +6,7 @@
 
 import { useEffect, useMemo, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { AlertCircle } from 'lucide-react';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useSchemaStore } from '@/stores/schemaStore';
@@ -24,6 +25,7 @@ interface DashboardViewProps {
 }
 
 export function DashboardView({ dashboardId, section }: DashboardViewProps) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const schema = useSchemaStore((s) => s.schema);
   const period = useDashboardStore((s) => s.period);
@@ -94,7 +96,9 @@ export function DashboardView({ dashboardId, section }: DashboardViewProps) {
   if (!dashboard) {
     if (dashboards.length === 0) {
       return (
-        <div className="flex items-center justify-center p-8 text-muted-foreground">No dashboards configured.</div>
+        <div className="flex items-center justify-center p-8 text-muted-foreground">
+          {t('dashboard.noConfigured', 'No dashboards configured.')}
+        </div>
       );
     }
     return null;

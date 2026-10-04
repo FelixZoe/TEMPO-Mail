@@ -823,7 +823,7 @@ export function DynamicList({ viewName }: DynamicListProps) {
   }
 
   if (!resolved.list) {
-    return <div className="p-8 text-center text-muted-foreground">No list configured</div>;
+    return <div className="p-8 text-center text-muted-foreground">{t('list.noConfigured', 'No list configured')}</div>;
   }
 
   const { obj, schema: resolvedSchema, list } = resolved;

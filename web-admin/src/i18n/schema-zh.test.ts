@@ -71,4 +71,62 @@ describe('localizeSchemaZh', () => {
       explanation: '管理用户账户',
     });
   });
+
+  it('translates server-driven forms, lists, filters, actions and dashboards', () => {
+    const schema = {
+      layouts: [],
+      lists: {
+        server: {
+          title: 'Mail Server',
+          subtitle: 'Connection Settings',
+          singularName: 'server',
+          pluralName: 'servers',
+          columns: [{ name: 'host', label: 'Relay Host' }],
+          filters: [{ type: 'text', field: 'host', label: 'Server Hostname' }],
+          massActions: [{ type: 'delete', label: 'Delete' }],
+        },
+      },
+      forms: {
+        server: {
+          title: 'Server Settings',
+          sections: [
+            {
+              title: 'Security Settings',
+              fields: [
+                {
+                  name: 'timeout',
+                  label: 'Connection Timeout',
+                  placeholder: 'Maximum duration in seconds',
+                },
+              ],
+            },
+          ],
+        },
+      },
+      dashboards: [
+        {
+          id: 'overview',
+          label: 'Dashboard',
+          cards: [{ title: 'Maximum Connections', description: 'View server connection metrics' }],
+        },
+      ],
+    };
+
+    const localized = localizeSchemaZh(schema);
+    expect(localized.lists.server).toMatchObject({
+      title: '邮件服务器',
+      subtitle: '连接设置',
+      columns: [{ label: '中继主机' }],
+      filters: [{ label: '服务器主机名' }],
+      massActions: [{ label: '删除' }],
+    });
+    expect(localized.forms.server).toMatchObject({
+      title: '服务器设置',
+      sections: [{ title: '安全设置', fields: [{ label: '连接超时' }] }],
+    });
+    expect(localized.dashboards[0]).toMatchObject({
+      label: '仪表盘',
+      cards: [{ title: '最大连接数' }],
+    });
+  });
 });

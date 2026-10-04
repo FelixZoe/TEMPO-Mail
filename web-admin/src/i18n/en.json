@@ -56,6 +56,7 @@
     "from": "From",
     "liveMetricsDisconnected": "Live metrics stream disconnected after multiple retries.",
     "liveMetricsFailed": "Failed to connect to live metrics.",
+    "noConfigured": "No dashboards configured.",
     "preset24h": "Last 24 hours",
     "preset30d": "Last 30 days",
     "preset7d": "Last 7 days",
@@ -145,6 +146,8 @@
   },
   "errors": {
     "unexpectedError": "An unexpected error occurred.",
+    "unknownComponent": "Unknown component: {{name}}",
+    "unknownView": "Unknown view: {{name}}",
     "viewNotFound": "View not found",
     "loadSchemaFailed": "Failed to load the admin panel configuration.",
     "notFound": "The requested resource was not found."
@@ -178,6 +181,7 @@
     "selectOptions": "Select options...",
     "time": "Time",
     "type": "Type",
+    "unsupported": "Unsupported field type",
     "typeAndPressEnter": "Type and press Enter...",
     "unknownObjectType": "Unknown object type: {{name}}"
   },
@@ -277,6 +281,7 @@
     "filters": "Filters",
     "massAction": "Actions",
     "next": "Next",
+    "noConfigured": "No list configured",
     "noResults": "No results found",
     "previous": "Previous",
     "resetFilters": "Reset",
