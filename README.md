@@ -1,11 +1,12 @@
 # TEMPO Mail
 
-TEMPO Mail 是面向 `@darker.one` 的独立邮件项目，不属于 TEMPO 主应用，也不复用 TEMPO 主仓库的发布工作流。
+TEMPO Mail 是专门为 [Stalwart Mail Server](https://stalw.art/) 适配的 iOS 邮件客户端与简体中文管理端，当前服务于 `@darker.one`。它是独立邮件项目，不属于 TEMPO 主应用，也不复用 TEMPO 主仓库的发布工作流。
 
 仓库包含两部分：
 
-- `ios/`：基于 [TabMail](https://github.com/TabMail/tabmail-ios) 二次开发的原生 SwiftUI 邮件客户端，默认连接 `mail.darker.one`，支持通用 IMAP/SMTP、本地邮件数据库、IMAP IDLE 和横屏。
-- `web-admin/`：基于 Stalwart WebAdmin 的完整简体中文管理端，用于域名、用户、队列、日志以及账号停用/恢复。
+- `ios/`：基于 [TabMail](https://github.com/TabMail/tabmail-ios) 二次开发的原生 SwiftUI 邮件客户端，默认连接 Stalwart 的 `mail.darker.one`，支持通用 IMAP/SMTP、本地邮件数据库、IMAP IDLE 和横屏，并提供受 Stalwart 自身权限系统保护的管理入口。
+- `web-admin/`：基于 Stalwart WebAdmin 深度汉化和适配的管理端，用于域名、用户、队列、日志以及账号停用/恢复。
+- `deploy/`：Stalwart WebAdmin 在 1Panel/OpenResty 下的入口和分包资源映射，避免管理端升级后出现动态模块哈希不一致。
 
 ## 已验证的邮件链路
 
@@ -62,4 +63,3 @@ npm run build
 - Web 管理端沿用 Stalwart 的 AGPL-3.0-only / SEL 双许可证文件。
 
 详见 [NOTICE.md](NOTICE.md)、`ios/LICENSE`、`ios/TRADEMARKS.md` 与 `web-admin/LICENSES/`。
-
