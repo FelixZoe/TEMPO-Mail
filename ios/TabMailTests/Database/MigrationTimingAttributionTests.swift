@@ -1,0 +1,556 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Testing
+import Foundation
+import GRDB
+import SQLite3
+@testable import TabMail
+
+/// THE INVARIANT: **the debug migration log accounts for the whole chain, and
+/// attributes each migration's foreign-key check to the migration that pays it.**
+///
+/// The defect this pins is not a crash or a data loss — it is a log that pointed
+/// at the wrong migration. `registerTimedMigration` timed only `try migrate(db)`,
+/// but GRDB runs `PRAGMA foreign_key_check`, the COMMIT and its `grdb_migrations`
+/// bookkeeping AFTER the closure returns. On a 500k-header database the chain
+/// line read ~87,000 ms while the per-migration lines summed to ~19,000 ms, and
+/// `v68` — whose real cost is ~9 s, essentially all foreign-key check — printed
+/// `applied in 0ms`.
+///
+/// 🚨 **BOTH TESTS ARE NEEDED AND NEITHER SUBSUMES THE OTHER.** The first pins
+/// the arithmetic (nothing is unattributed). An implementation that logged
+/// `fkCheck/commit = 0` for every migration and folded the whole gap into an
+/// "unattributed" bucket would FAIL it, but one that attributed the gap to the
+/// WRONG side would not — so the second test is the non-vacuity control: a
+/// `.deferred` migration must report a materially larger post-body interval than
+/// an `.immediate` one whose body does the same amount of work, because that
+/// difference IS the whole-database foreign-key check. Without it, a version
+/// that measures nothing and logs zeros passes.
+///
+/// ⚑ THE CONTROL PAIR IS NOW SYNTHETIC, AND THE PARAGRAPH THAT STOOD HERE SAID
+/// THE OPPOSITE. It read: *"The control pair is taken from the SHIPPING chain
+/// rather than from synthetic probe migrations: `v68` and `v71` are both a single
+/// `ALTER TABLE … ADD COLUMN` … Measuring the real pair means the control also
+/// fails if `v71`'s mode is ever quietly flipped, which a pair of throwaway probes
+/// would not notice."* That reasoning was sound and is now inapplicable: **`v71`
+/// was deliberately flipped to `.immediate` on 2026-08-06** (it cost 12,083 ms of
+/// whole-database `PRAGMA foreign_key_check` on the owner's device to guard one
+/// `ADD COLUMN`), and `v82` followed, so **no matched `.deferred`/`.immediate`
+/// pair with equal body cost exists in the shipping chain any more.** `v82` is not
+/// a substitute — its body rebuilds two tables, so a difference in post-body
+/// interval would not isolate the check.
+///
+/// The duty the real pair used to carry — *noticing a quiet mode flip* — has moved
+/// to `MigrationForeignKeyModeTests`, which asserts the END STATE the range is
+/// deliberately in. What is left here is the ledger's own arithmetic, and for that
+/// two probe migrations registered through the PRODUCTION wrapper
+/// (`DatabaseMigrator.registerTimedMigration`, made internal for this) are a
+/// strictly better control: identical bodies, opposite modes, same database, same
+/// instant.
+///
+/// `.serialized` + `.processGlobalState`: `MigrationTimingGate.forcedForTesting`
+/// is process-wide. The ledger itself is keyed by `Database` identity, so a
+/// concurrently-migrating suite records into its OWN chain and cannot contaminate
+/// these numbers — but the flag is still global state and is balanced by `defer`.
+@Suite("Migration timing attribution", .serialized, .processGlobalState)
+struct MigrationTimingAttributionTests {
+
+    private static let v67 = "v67_addUidResolutionRetryCount"
+
+    /// Probe identifiers for the non-vacuity control. Deliberately NOT `vNN_`
+    /// shaped: they are appended to a throwaway migrator inside one test, never
+    /// registered by `AppDatabase.registerAllMigrations`, and must be impossible to
+    /// mistake for a shipping migration in a log line or a `grdb_migrations` dump.
+    private static let probeImmediate = "probe_timingControl_immediate"
+    private static let probeDeferred = "probe_timingControl_deferred"
+
+    /// A v67-shaped database with `refs` foreign-key-bearing child rows, built
+    /// with the recording gate OFF so the setup migrations are not recorded.
+    ///
+    /// Raw SQL, not the model types: at v67 `MessageHeader` has no
+    /// `observedUidValidity` (v77) and `Draft` has no `lastTouchedSeq` (v79), so
+    /// a model insert would fail against the very schema being seeded.
+    private static func makeSeededV67Database(
+        headers: Int, refs: Int
+    ) throws -> DatabaseQueue {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: v67)
+
+        try db.write { db in
+            try db.execute(sql: """
+                INSERT INTO account (id, emailAddress, displayName, provider, createdAt)
+                VALUES ('acc1', 'acc1@example.com', 'Test', 'imap', 1)
+                """)
+            try db.execute(sql: """
+                INSERT INTO folder (id, accountId, name, path, role)
+                VALUES ('acc1:INBOX', 'acc1', 'INBOX', 'INBOX', 'inbox')
+                """)
+            try db.execute(sql: """
+                INSERT INTO userLabel (id, accountId, name) VALUES ('Label_0', 'acc1', 'Work')
+                """)
+            // Generated set-at-a-time rather than row-at-a-time: the interesting
+            // fixtures here are tens of thousands of rows, and a per-row
+            // `db.execute` re-prepares a statement each time, which made the
+            // SETUP dominate the thing being measured.
+            try db.execute(sql: """
+                \(Self.counter(upTo: headers))
+                INSERT INTO messageHeader
+                    (id, folderId, accountId, folderPath, isInInbox, messageId,
+                     rfc822MessageId, subject, `from`, fromAddress, `to`, date, isRead)
+                SELECT 'acc1:INBOX:' || i, 'acc1:INBOX', 'acc1', 'INBOX', 1, CAST(i AS TEXT),
+                       'rfc-' || i || '@example.com', 'subject',
+                       'sender@example.com', 'sender@example.com',
+                       'recipient@example.com', 1, i % 10 <> 0
+                FROM counter
+                """)
+            try db.execute(sql: """
+                \(Self.counter(upTo: headers))
+                INSERT INTO messageUserLabel (messageId, userLabelId)
+                SELECT 'acc1:INBOX:' || i, 'Label_0' FROM counter
+                """)
+            // The bulk of the foreign-key check's work: every one of these rows
+            // is a child key that `PRAGMA foreign_key_check` must resolve against
+            // `messageHeader`.
+            try db.execute(sql: """
+                \(Self.counter(upTo: refs))
+                INSERT INTO messageReference (messageHeaderId, referencedRfc822Id)
+                SELECT 'acc1:INBOX:' || (i % \(max(1, headers))),
+                       'rfc-parent-' || i || '@example.com'
+                FROM counter
+                """)
+        }
+        return db
+    }
+
+    /// `WITH counter(i) AS (…)` yielding `0 ..< limit`. Integer literal
+    /// interpolation only — every caller passes a constant from this file.
+    private static func counter(upTo limit: Int) -> String {
+        """
+        WITH RECURSIVE counter(i) AS (
+            SELECT 0 UNION ALL SELECT i + 1 FROM counter WHERE i + 1 < \(limit)
+        )
+        """
+    }
+
+    private static func withRecording<T>(_ body: () throws -> T) rethrows -> T {
+        MigrationTimingGate.forcedForTesting.withLock { $0 = true }
+        defer { MigrationTimingGate.forcedForTesting.withLock { $0 = false } }
+        return try body()
+    }
+
+    // MARK: - 1. The arithmetic reconciles
+
+    /// ⚠️ RETIRED DISPLAY NAME, recorded verbatim (`b87804055`): this test was
+    /// **"Bodies plus post-body intervals account for the whole v68…v83 chain"**
+    /// until R17b-B3. The range it names is the `.immediate` regime, which is an
+    /// OPEN interval that moves with the top of the chain (`MIS-031`), and the
+    /// old name was stale from `v84`. The body is unchanged — it migrates a
+    /// `v67` database to HEAD and reconciles every entry the ledger produced.
+    ///
+    /// This file was NOT in R17-6's scope and NOT in the R17b brief's, which
+    /// named `MigrationForeignKeyModeTests` alone. It is here because the census
+    /// was run over `TabMailTests/` rather than over the file already in hand
+    /// (`MIS-007`).
+    @Test("Bodies plus post-body intervals account for the whole v67-to-HEAD chain")
+    func chainAttributionReconciles() throws {
+        let db = try Self.makeSeededV67Database(headers: 400, refs: 4_000)
+
+        let report: MigrationTimingLedger.Report? = try Self.withRecording {
+            try AppDatabase.runMigrations(on: db)
+            return db.writeWithoutTransaction {
+                MigrationTimingLedger.shared.consumeReport(db: $0)
+            }
+        }
+
+        guard let report else {
+            Issue.record("no attribution report was produced for this writer")
+            return
+        }
+
+        var registered = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &registered)
+        let expected = Array(registered.migrations.drop(while: { $0 != Self.v67 }).dropFirst())
+        #expect(report.entries.map(\.identifier) == expected,
+                "every migration that ran must appear once, in order")
+
+        #expect(report.entries.allSatisfy { $0.postBodyMs != nil },
+                """
+                a migration whose post-body interval was never closed is exactly the \
+                unattributed time the old log hid — the reconciliation line would then \
+                under-report it instead of naming it
+                """)
+
+        // Each entry truncates DOWN to whole milliseconds twice (body and gap),
+        // so a chain sheds up to 2 ms per migration to rounding alone; the rest is
+        // GRDB's own pre-first-body setup. The tolerance is computed from
+        // `report.entries.count` rather than from a written-down chain length,
+        // which is why this sentence no longer states one: it read *"a
+        // 16-migration chain can shed ~32 ms"* until R17b-B3 and the chain has
+        // been 17 (v68…v84) since `v84` landed (`MIS-031`).
+        let tolerance = report.entries.count * 2 + 60
+        #expect(abs(report.unattributedMs) <= tolerance,
+                """
+                chain \(report.chainMs)ms vs bodies \(report.bodyMsTotal)ms + \
+                fkCheck/commit \(report.postBodyMsTotal)ms leaves \
+                \(report.unattributedMs)ms unattributed (tolerance \(tolerance)ms) — \
+                the whole point of this instrumentation is that the chain total and the \
+                per-migration lines agree
+                """)
+
+        // The mode label is the diagnostic: it is what lets a reader see that a
+        // multi-second gap is a whole-database check and not a slow commit.
+        let deferred = Set(report.entries.filter { $0.mode == "deferred" }.map(\.identifier))
+        #expect(deferred.isEmpty,
+                """
+                every migration from v68 up runs `foreignKeyChecks: .immediate` \
+                as of 2026-08-06, so the range runs no whole-database \
+                `PRAGMA foreign_key_check` at all — \(deferred.sorted()) is/are still \
+                deferred. This is an ANCHOR, not a style rule: on the owner's device the \
+                two gates that used to sit here (v71, v82) cost 19,311 ms of a 27,601 ms \
+                upgrade to guard bodies measuring 1 ms and 7 ms. Re-adding one puts that \
+                back on the launch path.
+                """)
+        #expect(report.entries.allSatisfy { $0.mode == "deferred" || $0.mode == "immediate" })
+    }
+
+    // MARK: - 2. Non-vacuity — the gap really is the foreign-key check
+
+    @Test("A deferred migration's post-body interval dwarfs an equivalent immediate one's")
+    func deferredPostBodyIntervalDwarfsImmediate() throws {
+        // Enough child rows that a whole-database `PRAGMA foreign_key_check` is
+        // unmistakably more expensive than a commit, without making the fixture
+        // slow. Sized deliberately generously: at 40,000 refs the measured gap was
+        // 6ms against 0ms, and the assertion rounds to whole milliseconds — a
+        // margin that thin would turn into a flake on faster hardware.
+        let db = try Self.makeSeededV67Database(headers: 2_000, refs: 120_000)
+
+        // THE MATCHED PAIR, registered through the production wrapper and appended
+        // AFTER the real chain: one `ALTER TABLE outboxMessage ADD COLUMN` each,
+        // against a table holding zero rows, so the bodies cost the same nothing.
+        // The only difference between them is the foreign-key mode, which is
+        // precisely what the post-body interval is supposed to be measuring.
+        let report: MigrationTimingLedger.Report? = try Self.withRecording {
+            var migrator = DatabaseMigrator()
+            AppDatabase.registerAllMigrations(on: &migrator)
+            migrator.registerTimedMigration(
+                Self.probeImmediate, foreignKeyChecks: .immediate
+            ) { db in
+                try db.alter(table: "outboxMessage") { $0.add(column: "probeImmediate", .text) }
+            }
+            migrator.registerTimedMigration(
+                Self.probeDeferred, foreignKeyChecks: .deferred
+            ) { db in
+                try db.alter(table: "outboxMessage") { $0.add(column: "probeDeferred", .text) }
+            }
+            try migrator.migrate(db)
+            return db.writeWithoutTransaction { db -> MigrationTimingLedger.Report? in
+                // The last body has no successor to close its interval, exactly as
+                // in `AppDatabase.runMigrations`.
+                MigrationTimingLedger.shared.finish(db: db)
+                return MigrationTimingLedger.shared.consumeReport(db: db)
+            }
+        }
+        guard let report else {
+            Issue.record("no attribution report was produced for this writer")
+            return
+        }
+
+        guard
+            let immediate = report.entries.first(where: { $0.identifier == Self.probeImmediate }),
+            let deferred = report.entries.first(where: { $0.identifier == Self.probeDeferred })
+        else {
+            Issue.record("""
+                the probe control pair is missing from the report — it carried \
+                \(report.entries.count) entries ending \
+                \(report.entries.suffix(3).map(\.identifier))
+                """)
+            return
+        }
+        #expect(immediate.mode == "immediate")
+        #expect(deferred.mode == "deferred",
+                """
+                the probes must reach GRDB with the modes they declared; if the wrapper \
+                ever stopped forwarding `foreignKeyChecks:` this control would silently \
+                stop controlling anything, so the mode is asserted rather than assumed
+                """)
+
+        let immediateGap = immediate.postBodyMs ?? -1
+        let deferredGap = deferred.postBodyMs ?? -1
+        #expect(deferredGap > 0,
+                """
+                the deferred migration reported a \(deferredGap)ms post-body interval over \
+                a database with 120,000 foreign-key-bearing child rows — an implementation \
+                that measures nothing and logs zeros would look exactly like this, which \
+                is what this control exists to catch
+                """)
+        #expect(deferredGap > immediateGap,
+                """
+                deferred \(deferredGap)ms vs immediate \(immediateGap)ms for two migrations \
+                whose bodies are the same single ADD COLUMN — the gap is supposed to BE the \
+                whole-database `PRAGMA foreign_key_check`, and `.immediate` runs no such \
+                check, so this ordering is the evidence that the interval is attributed to \
+                the right thing
+                """)
+
+        // The mirror image: the deferred migration's own BODY is not being charged
+        // the check either — the point of the split is that BOTH numbers are right,
+        // not merely that one of them is large. An `ALTER TABLE … ADD COLUMN` is a
+        // schema-only rewrite of `sqlite_master`; anything beyond a few ms here
+        // means the check leaked back into the body timer.
+        #expect(immediate.bodyMs <= 20 && deferred.bodyMs <= 20,
+                """
+                body times were immediate \(immediate.bodyMs)ms / deferred \
+                \(deferred.bodyMs)ms — an ADD COLUMN touches no row, so a large value \
+                means post-body work is being attributed to the body
+                """)
+    }
+}
+/// The chain-attribution line answers *how long*; this pair answers *over what*.
+///
+/// 🚨 THE DEFECT IT EXISTS TO FIX. The owner's device reported a **27,601 ms**
+/// migration chain and the log gave no denominator, so "slow migrations" and "a very
+/// large mailbox" were indistinguishable — and they have OPPOSITE remedies. A
+/// duration with no denominator is not observability.
+///
+/// Unlike everything else in `MigrationTimingLedger`, `measureChainScale` /
+/// `logChainScale` are ALWAYS ON (project rule 12 exception (b)), which is why the
+/// cost containment is asserted here rather than assumed: the caller emits the line
+/// only when the chain has unapplied migrations, so an ordinary launch pays one
+/// `grdb_migrations` read and nothing else.
+@Suite("Migration chain scale calibration")
+struct MigrationChainScaleTests {
+
+    /// A fresh install is measured BEFORE `v1` runs, so none of the four tables
+    /// exists. `nil` and `0` must stay distinguishable: rendering both as `0` would
+    /// make a fresh install read exactly like a user who deleted all their mail, and
+    /// the whole point of this line is telling those apart.
+    @Test("A pre-schema database reports absent counts, not zero counts")
+    func preSchemaDatabaseReportsAbsentNotZero() throws {
+        let db = try DatabaseQueue()
+        let scale = try db.read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 83)
+        }
+        #expect(scale.messageHeadersAtMost == nil)
+        #expect(scale.messageBodiesAtMost == nil)
+        #expect(scale.accounts == nil)
+        #expect(scale.folders == nil)
+        #expect(scale.pendingMigrations == 83)
+        // The page pragmas answer on any database, schema or not — that is the one
+        // figure a fresh install can still report.
+        #expect(scale.databaseBytes != nil)
+    }
+
+    /// The other side, and the one that makes the first non-vacuous: on a migrated,
+    /// populated database every count is present and reports what was seeded.
+    @Test("A populated database reports the counts the chain is about to walk")
+    func populatedDatabaseReportsItsScale() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        for i in 0..<7 {
+            try TestDatabase.insertMessageHeader(db, messageId: "\(i)", date: Date())
+        }
+
+        let scale = try db.read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 0)
+        }
+        // A ceiling, but an exact one here: nothing has been deleted, so `MAX(rowid)`
+        // and `COUNT(*)` coincide. Asserting the number rather than merely its presence
+        // is what stops an O(1) rewrite from reporting a plausible-looking wrong scale.
+        #expect(scale.messageHeadersAtMost == 7,
+                "seeded 7 headers, measured \(String(describing: scale.messageHeadersAtMost))")
+        #expect(scale.accounts == 1)
+        #expect(scale.folders == 1)
+        // 🚨 THE `COALESCE` GUARD. `messageBody` exists in the migrated schema and is
+        // EMPTY in this fixture, which is the one case where `MAX(rowid)` returns SQL
+        // `NULL`. Without `COALESCE(..., 0)` that arrives as `nil` and renders `n/a` —
+        // collapsing "no schema" into "empty mailbox", the exact distinction
+        // `preSchemaDatabaseReportsAbsentNotZero` above exists to keep. `0`, not `nil`.
+        #expect(scale.messageBodiesAtMost == 0,
+                """
+                messageBody exists in the migrated schema and is empty, so its ceiling \
+                must be 0 — `nil` here means the COALESCE was dropped and an empty \
+                mailbox now reads as a fresh install
+                """)
+        #expect((scale.databaseBytes ?? 0) > 0)
+    }
+
+    /// THE SELF-REPORTING CONTRACT: `measurementMs` is present and finite, so the
+    /// calibration's own cost is subtractable from the aggregate line it inflates.
+    ///
+    /// ⚠️ **THIS TEST IS SCALE-BLIND AND CANNOT DETECT AN EXPENSIVE MEASUREMENT. It is
+    /// kept for the contract above and must NOT be read as cost containment.** Its
+    /// fixture is four EMPTY tables, so the property it appears to guard — "the
+    /// calibration has not become a cost of its own" — cannot fail here no matter how
+    /// bad the queries are: on an empty database even a full table scan is free. It was
+    /// green throughout the entire period in which this measurement cost the owner's
+    /// device **7,533 ms, 38.5% of a 19,558 ms migration splash**. That is the
+    /// blessing-test shape (`feedback_non_vacuity_must_be_two_sided`): a green test
+    /// that certifies nothing.
+    ///
+    /// **Tightening the millisecond bound here would not repair it** — the fixture, not
+    /// the threshold, is what makes it vacuous, and a wall-clock threshold is
+    /// machine-dependent anyway. Cost containment is now pinned by
+    /// `chainScaleMeasurementIsFlatInRowCount` below, on the axis that actually drives
+    /// the cost and in a machine-independent unit.
+    @Test("The measurement reports its own cost")
+    func measurementReportsAndBoundsItsOwnCost() throws {
+        let db = try TestDatabase.make()
+        let scale = try db.read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 1)
+        }
+        #expect(scale.measurementMs >= 0)
+        #expect(scale.measurementMs < 1_000,
+                """
+                measuring four EMPTY tables took \(scale.measurementMs)ms — this bound \
+                only catches a pathology so gross it shows up at zero rows; see \
+                chainScaleMeasurementIsFlatInRowCount for the real containment
+                """)
+    }
+
+    // MARK: - Cost containment, on the axis that actually drives it
+
+    /// 🚨 **THE INVARIANT: the chain-scale measurement's cost does not grow with the
+    /// mailbox.** It runs INSIDE the window the aggregate *"schema migrations completed
+    /// in Nms"* line covers, on the blocking launch path, in front of a splash screen —
+    /// so a calibration that scales with the thing it is calibrating is a startup
+    /// regression that grows with the user's mailbox.
+    ///
+    /// **Measured in pager cache misses (`SQLITE_DBSTATUS_CACHE_MISS`), not milliseconds.**
+    /// Pages-read is the quantity the device actually pays for (each is a random,
+    /// encrypted flash read) and it is identical on a fast Mac and a cold iPhone, so
+    /// this test cannot flake on a loaded CI machine the way a wall-clock threshold can.
+    ///
+    /// **THE RED AXIS IS ROW COUNT.** Reverting `measureChainScale` to `COUNT(*)` fails
+    /// the `manyRows` assertion below and nothing else.
+    ///
+    /// ⚠️ **THE BYTE AXIS IS ASSERTED BUT IS *NOT* RED AGAINST THE PRE-FIX CODE, and it
+    /// is recorded here because the pre-fix code was blamed on it twice in writing
+    /// before anyone measured it (`MIS-019`, `MIS-015`).** The story was "`COUNT(*)`
+    /// walks the table b-tree and drags 2.9 GB of `htmlContent` overflow pages through
+    /// the pager". SQLite serves both counts from a small covering index and never
+    /// touches an overflow page, so the pre-fix code was ALREADY flat in bytes — 160,000
+    /// bodies cost 1,177 pages at 19 MB of html and 1,177 pages at 2,747 MB. Seeding
+    /// byte volume alone would therefore have produced a red-looking test that was green
+    /// on the bug. The `fatBytes` assertion is kept as a REGRESSION guard with a
+    /// specific future defect in view: a predicate on a non-indexed column
+    /// (`... WHERE htmlContent IS NOT NULL`) would force the table b-tree and finally
+    /// make the overflow-page story true.
+    @Test("The chain-scale measurement is flat in row count and in byte volume")
+    func chainScaleMeasurementIsFlatInRowCount() throws {
+        let baseline = try Self.makeScaleFixture(rows: 200, htmlBytes: 2)
+        let manyRows = try Self.makeScaleFixture(rows: 20_000, htmlBytes: 2)
+        let fatBytes = try Self.makeScaleFixture(rows: 200, htmlBytes: 40_000)
+        defer { for url in [baseline, manyRows, fatBytes] { try? FileManager.default.removeItem(at: url) } }
+
+        // NON-VACUITY, stated as positive facts about the fixtures. Without these a
+        // silently-empty seed would make every comparison below trivially true — which
+        // is exactly how the scale-blind test above stayed green for so long.
+        let baseScale = try Self.chainScale(at: baseline)
+        let manyScale = try Self.chainScale(at: manyRows)
+        let fatScale = try Self.chainScale(at: fatBytes)
+        #expect(baseScale.messageHeadersAtMost == 200)
+        #expect(manyScale.messageHeadersAtMost == 20_000,
+                "the many-rows fixture must really carry 100x the rows, else this test proves nothing")
+        #expect(manyScale.messageBodiesAtMost == 20_000)
+        #expect(fatScale.messageHeadersAtMost == 200)
+        let baseBytes = try Self.fileSize(baseline)
+        let fatFileBytes = try Self.fileSize(fatBytes)
+        #expect(fatFileBytes > baseBytes * 10,
+                """
+                the fat-bytes fixture must really be much larger on disk \
+                (\(fatFileBytes) vs \(baseBytes) bytes), else its assertion proves nothing
+                """)
+
+        let basePages = try Self.pagesReadMeasuringChainScale(at: baseline)
+        let manyPages = try Self.pagesReadMeasuringChainScale(at: manyRows)
+        let fatPages = try Self.pagesReadMeasuringChainScale(at: fatBytes)
+        #expect(basePages > 0, "the page counter must be live, else every bound below is vacuous")
+
+        #expect(manyPages <= basePages * 2,
+                """
+                THE INVARIANT BROKE: 100x the rows cost \(manyPages) pages vs \
+                \(basePages) at baseline, so the calibration is back on the row axis. \
+                This is what charged the owner's device 7,533ms in front of the splash.
+                """)
+        #expect(fatPages <= basePages * 2,
+                """
+                the measurement now reads \(fatPages) pages vs \(basePages) at baseline \
+                on a fixture that differs only in htmlContent SIZE — something started \
+                touching the body b-tree instead of the covering index
+                """)
+    }
+
+    // MARK: - Fixtures for the cost-containment test
+
+    /// An ON-DISK migrated database. On disk is load-bearing: pager cache misses are
+    /// only meaningful against a real VFS, and an in-memory database would report a
+    /// constant and make the test vacuous.
+    private static func makeScaleFixture(rows: Int, htmlBytes: Int) throws -> URL {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("chain-scale-\(UUID().uuidString).sqlite")
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let queue = try DatabaseQueue(path: url.path, configuration: config)
+        try AppDatabase.runMigrations(on: queue)
+        try TestDatabase.insertAccount(queue, id: "acct-1")
+        try TestDatabase.insertFolder(queue, accountId: "acct-1")
+        try queue.write { db in
+            try db.execute(sql: """
+                INSERT INTO messageHeader
+                    (id, folderId, accountId, folderPath, messageId, subject,
+                     "from", fromAddress, "to", date)
+                WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < \(rows))
+                SELECT printf('acct-1:INBOX:%d', n), 'acct-1:INBOX', 'acct-1', 'INBOX',
+                       CAST(n AS TEXT), 'Subject', 'Sender <s@domain.com>',
+                       's@domain.com', 'me@domain.com',
+                       datetime(1700000000 + n * 60, 'unixepoch')
+                FROM s
+                """)
+            try db.execute(sql: """
+                INSERT INTO messageBody (id, htmlContent, fetchedAt)
+                WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < \(rows))
+                SELECT printf('acct-1:INBOX:%d', n), hex(zeroblob(\(max(1, htmlBytes / 2)))),
+                       datetime('now')
+                FROM s
+                """)
+        }
+        return url
+    }
+
+    private static func fileSize(_ url: URL) throws -> Int {
+        (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+    }
+
+    private static func chainScale(at url: URL) throws -> MigrationTimingLedger.ChainScale {
+        try DatabaseQueue(path: url.path).read { db in
+            MigrationTimingLedger.measureChainScale(db, pendingMigrations: 1)
+        }
+    }
+
+    /// Pages the pager had to fetch through the VFS while running one whole
+    /// `measureChainScale`.
+    ///
+    /// A FRESH connection per call is load-bearing. GRDB keeps one connection per
+    /// `DatabaseQueue` and its pager cache survives between statements, so measuring
+    /// twice on one queue would report the second run as nearly free and make every
+    /// comparison in the test pass by construction.
+    private static func pagesReadMeasuringChainScale(at url: URL) throws -> Int {
+        try DatabaseQueue(path: url.path).read { db in
+            guard let handle = db.sqliteConnection else { return -1 }
+            var current: Int32 = 0
+            var highwater: Int32 = 0
+            // resetFlag 1 zeroes the counter, so what follows is measured from zero.
+            sqlite3_db_status(handle, SQLITE_DBSTATUS_CACHE_MISS, &current, &highwater, 1)
+            _ = MigrationTimingLedger.measureChainScale(db, pendingMigrations: 1)
+            sqlite3_db_status(handle, SQLITE_DBSTATUS_CACHE_MISS, &current, &highwater, 0)
+            return Int(current)
+        }
+    }
+}

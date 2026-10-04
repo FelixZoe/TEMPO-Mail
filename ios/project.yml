@@ -1,0 +1,178 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: TEMPOMail
+options:
+  bundleIdPrefix: one.darker
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "27.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+configFiles:
+  Debug: Secrets.xcconfig
+  Release: Secrets.xcconfig
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    # DEVELOPMENT_TEAM is sourced from Secrets.xcconfig (gitignored) by
+    # Scripts/xcodegen.sh and expanded here at generation time, so the Apple
+    # Developer Team ID stays out of the public repo. It MUST be referenced here
+    # (not only in the xcconfig) so XcodeGen writes DevelopmentTeam into
+    # TargetAttributes for ALL targets — including the Notification Service
+    # Extension, which otherwise ships with no resolved team and fails on-device
+    # code-sign validation (the NSE never launches). ALWAYS generate via
+    # ./Scripts/xcodegen.sh — a bare `xcodegen generate` with the var unset
+    # writes a literal "${DEVELOPMENT_TEAM}" and breaks signing. See
+    # Secrets.xcconfig.example. Simulator + unit-test builds sign ad-hoc.
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    CODE_SIGN_IDENTITY: "Apple Development"
+    CODE_SIGN_STYLE: Automatic
+
+packages:
+  SwiftMail:
+    url: https://github.com/TabMail/SwiftMail.git
+    revision: 124e3cca5bea7d544925455533cdbce72d6f9755
+  SwiftSoup:
+    url: https://github.com/scinfu/SwiftSoup.git
+    from: "2.6.0"
+  GRDB:
+    url: https://github.com/groue/GRDB.swift.git
+    from: "7.0.0"
+
+targets:
+  TabMail:
+    type: application
+    platform: iOS
+    sources:
+      - path: TabMail
+        excludes:
+          - "Resources/Info.plist"
+          - "Vendor/sqlite-vec/*.c"
+          - "Vendor/sqlite-vec/LICENSE-*"
+      - path: Shared
+      - path: TabMail/Vendor/sqlite-vec
+        includes:
+          - "*.c"
+        compilerFlags: "-w"
+      - path: TabMail/Resources
+        excludes:
+          - "Info.plist"
+        buildPhase: resources
+    settings:
+      base:
+        INFOPLIST_FILE: TabMail/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: TabMail/TabMail.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: one.darker.tempomail
+        PRODUCT_NAME: "TEMPO Mail"
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        TABMAIL_PROTOCOL_VERSION: "0.1.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_STRICT_CONCURRENCY: complete
+        SWIFT_OBJC_BRIDGING_HEADER: TabMail/TabMail-Bridging-Header.h
+        OTHER_CFLAGS: "-DSQLITE_CORE"
+    dependencies:
+      - package: SwiftMail
+      - package: SwiftSoup
+      - package: GRDB
+      - target: TabMailNotificationService
+
+  TabMailNotificationService:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: TabMailNotificationService
+        excludes:
+          - "Info.plist"
+      - path: Shared
+    settings:
+      base:
+        INFOPLIST_FILE: TabMailNotificationService/Info.plist
+        CODE_SIGN_ENTITLEMENTS: TabMailNotificationService/TabMailNotificationService.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: one.darker.tempomail.NotificationService
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_STRICT_CONCURRENCY: complete
+        GENERATE_INFOPLIST_FILE: NO
+        # Build the extension as a normal Mach-O in Debug instead of Xcode 16's
+        # debug-dylib stub. Improves reliability when attaching to / debugging the
+        # NSE locally; no effect on Release builds (they don't use the debug dylib).
+        ENABLE_DEBUG_DYLIB: NO
+    dependencies:
+      - package: SwiftSoup
+      - package: GRDB
+        product: GRDB
+      # SwiftMail powers NSE-side IMAP fetches on `imap_new_mail` / `imap_reconnect`
+      # pushes. Same fork the main-app IMAPProvider uses — keeps behavior identical.
+      # NSE runs in a 24 MB / 30 s sandbox; SwiftNIO static-link footprint is
+      # ~2–4 MB per arch, per-connection live heap ~1–2 MB. Verified by on-device
+      # measurement before ship.
+      - package: SwiftMail
+
+  TabMailTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: TabMailTests
+      # Compile the real NSE entry and adapters so lifecycle tests traverse the
+      # same gates as a delivered notification.
+      - path: TabMailNotificationService
+        excludes:
+          - Info.plist
+          - "*.entitlements"
+    settings:
+      GENERATE_INFOPLIST_FILE: YES
+      # Set ONLY here. The NSE files above that name `Shared` types —
+      # `NSEStagingDB` (`RenderedBody`, `MessageIdentity`), `NSELog`
+      # (`NSELogStore`, `NSEProviderSupport`) and `SharedNSEData` (`NSEBadge`,
+      # `NSELogStore`) — reach them through `#if TABMAIL_TESTS @testable import
+      # TabMail`, because in this target those types live in the main-app module
+      # and are internal. In the NSE target they are compiled in directly and
+      # the import must NOT appear. `NSEMessageMetadata` and `NSEConfig` name
+      # none, and carry no import.
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) TABMAIL_TESTS"
+    dependencies:
+      - target: TabMail
+
+  TabMailScreenshots:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: TabMailScreenshots
+    settings:
+      GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: TabMail
+
+schemes:
+  TabMail:
+    build:
+      targets:
+        TabMail: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - TabMailTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+  TabMailScreenshots:
+    build:
+      targets:
+        TabMail: build
+        TabMailScreenshots: [test]
+    test:
+      targets:
+        - TabMailScreenshots

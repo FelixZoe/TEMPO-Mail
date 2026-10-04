@@ -1,0 +1,2332 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+import GRDB
+import Synchronization
+
+extension SyncEngine {
+
+    /// Render one segment of the debug-gated `fullSync upsert` diagnostic:
+    /// `"<verb> N header(s): a,b,c (+K more)"`. `verb` is `"inserted"` for the
+    /// rows a pass INSERTED and `"reclaimed"` for the existing rows it re-homed
+    /// into the folder in place (the orphan-reclaim arm); both segments use the
+    /// same cap and overflow arithmetic, so a reader compares like with like.
+    ///
+    /// Extracted as a PURE, `nonisolated static` function because the diagnostic
+    /// it renders
+    /// is built inside a `dbPool.write` closure (and emitted only after that
+    /// write commits) behind a runtime debug gate, so inline it can only be
+    /// executed by a test that also unlocks that gate, and its OVERFLOW branch
+    /// needs more inserted headers than any sync fixture produces. Split out,
+    /// both branches are directly unit-testable and the call site is one
+    /// expression per segment.
+    ///
+    /// ⚠️ The cap is a DISPLAY cap on synthetic header IDS and nothing else. It
+    /// bounds no fetch, no batch and nothing written to the database: every
+    /// inserted row is still inserted, and the elided count is STATED rather than
+    /// dropped, so the line never claims to be exhaustive when it is not. Global
+    /// `CLAUDE.md` rule 11 names exactly this shape as not being data truncation.
+    nonisolated static func upsertInsertedIdSummary(_ ids: [String], verb: String = "inserted") -> String {
+        let cap = SyncConfig.upsertInsertedIdLogCap
+        let elided = ids.count - cap
+        let overflow = elided > 0 ? " (+\(elided) more)" : ""
+        return "\(verb) \(ids.count) header(s): "
+            + ids.prefix(cap).joined(separator: ",")
+            + overflow
+    }
+
+    /// The one optimistic-placeholder dedup statement shared by full sync,
+    /// Gmail delta sync, and Exchange delta sync. Named so plan and consumer
+    /// coverage execute the same SQL as production.
+    nonisolated static let optimisticDedupSQL = """
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE folderId = ? AND rfc822MessageId = ? AND messageId <> ?
+        ORDER BY id ASC
+        LIMIT 1
+        """
+
+    // MARK: - Full-sync MODSEQ fetch-skip (Fix B task 4)
+
+    /// Per-folder counter of full syncs since the last deep pass. Forces a DEEP
+    /// (never-skip) pass every `SyncConfig.fullSyncDeepEveryN` so a buggy / quirky server
+    /// HIGHESTMODSEQ can't permanently strand a folder — the ADR-IOS-009 self-healing net.
+    /// In-memory: resets on launch (a MODSEQ-equal skip is provably safe anyway — modseq
+    /// is monotonic within a UIDVALIDITY epoch, so equal means nothing changed).
+    private static let fullSyncSkipStreak = Mutex<[String: Int]>([:])
+
+    /// Is THIS full sync of `folderId` a deep (never-skip) pass? Deep every Nth; a deep
+    /// pass resets the streak. Called once per candidate folder per full sync.
+    nonisolated static func fullSyncIsDeepPass(folderId: String, everyN: Int) -> Bool {
+        fullSyncSkipStreak.withLock { streak in
+            let n = (streak[folderId] ?? 0) + 1
+            if n >= max(1, everyN) { streak[folderId] = 0; return true }
+            streak[folderId] = n
+            return false
+        }
+    }
+
+    /// Full-sync fetch-skip decision. Skip re-fetching a folder ONLY when CONDSTORE proves
+    /// nothing changed since our last sync: HIGHESTMODSEQ (which RFC 7162 bumps on ANY
+    /// add / delete / flag change) is present on BOTH sides and equal. NEVER skip the
+    /// inbox (always fully synced), a deep pass, or a non-CONDSTORE folder (nil modseq →
+    /// fetch, exactly today's behavior). Deletion safety is unaffected: MODSEQ gates only
+    /// the FETCH (never a delete), and the deletion-reconcile check still runs for skipped
+    /// folders. Pure + nonisolated for unit testing.
+    nonisolated static func shouldSkipFolderFetch(
+        role: FolderRole, freshModSeq: Int?, cachedModSeq: Int?, isDeepSync: Bool
+    ) -> Bool {
+        guard role != .inbox, !isDeepSync else { return false }
+        guard let freshModSeq, let cachedModSeq else { return false }
+        return freshModSeq == cachedModSeq
+    }
+
+    // MARK: - Full Sync
+
+    func fullSync(account: Account, provider: any EmailProvider) async throws {
+        let fs0 = CFAbsoluteTimeGetCurrent()
+        let acctTag = "\(account.provider):\(account.id.prefix(6))"
+        BootProfiler.mark("fullSync[\(acctTag)] START (network — fetch folders + inbox headers → populates inbox)")
+        // Sync folder list
+        let remoteFolders = try await provider.fetchFolders()
+        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+        BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+
+        let pool = dbPool
+        // Fix B task 4: folders whose CONDSTORE HIGHESTMODSEQ is unchanged since last sync
+        // — RFC 7162 guarantees nothing changed (add/delete/flag), so the per-folder fetch
+        // below is skipped. Computed HERE, before the cursor overwrite destroys the cached
+        // modseq. NEVER includes the inbox or a deep pass (see shouldSkipFolderFetch); the
+        // deletion-reconcile check still runs for skipped folders (safety net).
+        let skippablePaths: Set<String> = try await pool.write { db in
+            var skippable: Set<String> = []
+            let localFolders = try Folder.filter(Column("accountId") == account.id).fetchAll(db)
+
+            for info in remoteFolders {
+                if var existing = localFolders.first(where: { $0.path == info.path }) {
+                    // Unconditional — it advances the per-folder deep-pass streak counter.
+                    let deep = Self.fullSyncIsDeepPass(
+                        folderId: existing.id, everyN: SyncConfig.fullSyncDeepEveryN)
+                    // NOTE (T1.2): an epoch-aware term was tried here and REMOVED. Making a
+                    // UIDVALIDITY turnover block this skip forces the folder down
+                    // `runSyncMessages`, whose windowed stale sweep has NO epoch guard — so
+                    // "more fetching" is NOT the conservative direction here: it converts a
+                    // skipped folder into a swept one and DELETES the old-epoch mail that
+                    // HEAD leaves alone. The sweep needs the guard first (see
+                    // `runSyncMessages`); until then this gate stays exactly as it was.
+                    if Self.shouldSkipFolderFetch(
+                        role: existing.role, freshModSeq: info.highestModSeq,
+                        cachedModSeq: existing.lastKnownHighestModSeq, isDeepSync: deep) {
+                        skippable.insert(info.path)
+                    }
+                    existing.name = info.name
+                    existing.totalCount = info.totalCount
+                    if let uidNext = info.uidNext { existing.lastKnownUidNext = uidNext }
+                    if let modseq = info.highestModSeq { existing.lastKnownHighestModSeq = modseq }
+                    // BOOTSTRAP the epoch for a folder the deletion-reconcile walk has
+                    // never visited (it was previously the only writer) — and ONLY
+                    // bootstrap. `uidValidityBootstrapWrite` writes nothing once the column
+                    // holds a value, so a nil/0 observation cannot erase it and a turnover
+                    // cannot overwrite it (which would disarm the walk's abort guard —
+                    // ADR-IOS-051; see the helper's doc comment). `localFolders` is read
+                    // inside THIS write transaction, so `existing` is not a stale snapshot.
+                    //
+                    // T4.S6b — the header-existence term. This site is the FIRST stamper on
+                    // an upgrade for a UIDPLUS server: it runs before any per-folder SELECT,
+                    // so gating only `runSyncMessages` would leave it stamping every folder
+                    // by assertion. It cannot route through `bootstrapFolderUidValidity`
+                    // (which carries the term in its statement) because it sets the field on
+                    // a record it is already updating, so it discharges the same term in
+                    // Swift — sound HERE and only here, because the count is read inside
+                    // THIS write transaction with no suspension before the `update`.
+                    // `isEmpty` compiles to `SELECT EXISTS(SELECT … LIMIT 1)`, which
+                    // stops at the first index entry. `fetchCount` walks every entry
+                    // for a folder — pure waste for a question that is answered by
+                    // one row, inside the single GRDB writer. Same shape as the
+                    // `NOT EXISTS (SELECT 1 FROM messageHeader WHERE folderId = …)`
+                    // term already inside `bootstrapFolderUidValidity`'s statement;
+                    // this site must stay in Swift (see the note above), so it ports
+                    // the predicate's SHAPE rather than its location.
+                    let existingHoldsRows = try !MessageHeader
+                        .filter(Column("folderId") == existing.id).isEmpty(db)
+                    if let bootstrap = Self.uidValidityBootstrapWrite(
+                        observed: info.uidValidity, stored: existing.lastKnownUidValidity,
+                        folderHoldsRows: existingHoldsRows) {
+                        existing.lastKnownUidValidity = bootstrap
+                    }
+                    try existing.update(db)
+                } else {
+                    var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
+                    folder.totalCount = info.totalCount
+                    folder.lastKnownUidNext = info.uidNext
+                    // A brand-new row is by definition a first observation — the same
+                    // bootstrap rule, which here also filters the `0` = "not reported"
+                    // sentinel out of the column.
+                    //
+                    // ⚠ T4.S6b — "a new row is by definition an empty folder" is FALSE, and
+                    // that is residual path (b) in `UidValidityTurnoverDeletionGuardTests`:
+                    // `Folder.id` is the deterministic `"\(accountId):\(path)"` and the
+                    // vanished-folder cleanup below deletes the ROW while migration `v2`
+                    // leaves its headers orphaned, so a re-created path RE-ADOPTS old-epoch
+                    // rows the instant this insert lands. The term is therefore required on
+                    // BOTH arms.
+                    // Existence test, not a count — see the sibling arm above.
+                    let recreatedHoldsRows = try !MessageHeader
+                        .filter(Column("folderId") == folder.id).isEmpty(db)
+                    folder.lastKnownUidValidity = Self.uidValidityBootstrapWrite(
+                        observed: info.uidValidity, stored: nil,
+                        folderHoldsRows: recreatedHoldsRows)
+                    try folder.insert(db)
+                }
+            }
+
+            // Remove local folders that no longer exist remotely
+            let remotePaths = Set(remoteFolders.map(\.path))
+            for folder in localFolders where !remotePaths.contains(folder.path) {
+                // NOTE: this used to say "CASCADE handles messageHeader deletion
+                // automatically". That is FALSE — migration `v2_dropMessageHeaderFolderFK`
+                // made `messageHeader.folderId` a plain column with NO foreign key to
+                // `folder` (only `accountId` cascades). Deleting the folder row therefore
+                // leaves its headers ORPHANED: they survive, still pointing at a
+                // `folderId`/`folderPath` that now has no metadata. Because `Folder.id` is
+                // the deterministic `"\(accountId):\(path)"`, a later re-appearance of the
+                // same path re-adopts those orphans under a BRAND-NEW row whose
+                // `lastKnownUidValidity` is nil — old-epoch mail under an unknown epoch.
+                // See `Folder.lastKnownUidValidity`'s doc comment for why that is an open
+                // hazard rather than a benign one.
+                try folder.delete(db)
+            }
+
+            // Sync user labels from the folder list (Gmail: user labels appear as custom folders).
+            // One UserLabel per Gmail label. Nested labels (e.g., "Work/Projects/Alpha") are stored
+            // with their full name — splitting into segments happens at display time in the chip view.
+            if account.provider == .gmail {
+                let existingLabelIds = try String.fetchSet(db,
+                    UserLabel.select(Column("id")).filter(Column("accountId") == account.id)
+                )
+                var seenLabelIds: Set<String> = []
+
+                for info in remoteFolders {
+                    let labelId = info.path
+                    // Skip tm_* labels (handled by ActionTag) and system/auto-created labels
+                    if UserLabelStore.isExcludedKeyword(info.name) { continue }
+
+                    let isSystem = UserLabelStore.isGmailSystemLabel(id: labelId, name: info.name)
+                    let row = UserLabel(
+                        accountId: account.id, providerLabelId: labelId,
+                        name: info.name, isSystem: isSystem
+                    )
+                    try row.save(db) // upsert
+                    // 🚨 THE SWEEP BELOW COMPARES DB IDS, SO THIS MUST BE THE DB ID.
+                    // `existingLabelIds` is read from `userLabel.id`, which is the
+                    // account-prefixed surrogate (D10 / `IOS-LABEL-001`). Recording the
+                    // BARE `labelId` here would make `staleLabelIds` the whole existing
+                    // set on every single sync — i.e. delete every label row this account
+                    // has, and (via `messageUserLabel`'s `onDelete: .cascade`) every
+                    // association with it. This is the most dangerous consumer of the
+                    // surrogate, which is why the row is bound to a local and its own id
+                    // reused rather than the mint being repeated.
+                    seenLabelIds.insert(row.id)
+                }
+
+                // Remove user labels that no longer exist on server
+                let staleLabelIds = existingLabelIds.subtracting(seenLabelIds)
+                if !staleLabelIds.isEmpty {
+                    try UserLabel
+                        .filter(staleLabelIds.contains(Column("id")) && Column("accountId") == account.id)
+                        .deleteAll(db)
+                }
+            }
+            return skippable
+        }
+
+        if !skippablePaths.isEmpty {
+            BootProfiler.mark("fullSync[\(acctTag)]: skipped \(skippablePaths.count) MODSEQ-unchanged folder(s) — no re-fetch (reconcile still runs)")
+        }
+
+        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
+
+        // Fetch fresh folder list after upsert
+        let folders = try await pool.read { db in
+            try Folder.filter(Column("accountId") == account.id).fetchAll(db)
+        }
+
+        // Sync messages for main roles + favorited folders, prioritized:
+        // inbox first, then favorites, then secondary roles, then custom.
+        // Custom non-favorited folders sync on-demand when the user navigates to them.
+        let primary = self.primaryRoles
+        let secondary = self.secondaryRoles
+        let syncableFolders = folders.filter { folder in
+            primary.contains(folder.role) ||
+            secondary.contains(folder.role) ||
+            folder.isFavorite
+        }.sorted { a, b in
+            func priority(_ f: Folder) -> Int {
+                if primary.contains(f.role) { return 0 }
+                if f.isFavorite { return 1 }
+                if secondary.contains(f.role) { return 2 }
+                return 3
+            }
+            return priority(a) < priority(b)
+        }
+
+        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
+
+        // Heavy per-folder sync — run off main thread.
+        // All network + DB operations (provider.fetchMessages, dbPool.read/write) are
+        // thread-safe. Running here avoids dozens of MainActor await-resume hops.
+        // Helper: process sync result — FTS indexing, ReplyDetect notifications, collect migrated IDs.
+        // Extracted to avoid duplication between initial sync and connection-error retry.
+        @Sendable func processSyncResult(_ result: SyncMessagesResult, folder: Folder) async -> [String] {
+            await Self.publishHeaderRekeys(result.headerRekeys)
+            // Yield to a privileged merge before this folder's FTS writes (rekey /
+            // remove / index). SearchIndex is a separate pool with sync `@noasync`
+            // writes, so the async caller yields on its behalf.
+            await PriorityGate.shared.yield("sync-fts")
+            ReplyParentResolver.postParentNotifications(result.replyDetectIds)
+            if !result.ftsRekeys.isEmpty {
+                // In-place FTS re-key (UID remap / remnant canonicalization) —
+                // preserves the indexed body text + embedding under the new id.
+                try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys.map {
+                    (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId),
+                     newMessageId: $0.newMessageId)
+                })
+            }
+            if !result.staleIds.isEmpty {
+                // Routed through `MessageContentStore` (as the non-retry path's
+                // `removeHeadersFromFTS` is): the stale headers are already deleted by
+                // the sync write above, so the owner count here sees the post-delete
+                // world — the ordering the gate depends on. `.body` joins from
+                // Stage D, which dropped the FK cascade that used to reclaim it.
+                await MessageContentStore.releaseUnowned(
+                    result.staleIds.map(ContentKey.init(rawValue:)), stores: [.searchIndex, .body])
+            }
+            if !result.newHeaders.isEmpty {
+                let records = result.newHeaders.map { header in
+                    FTSHeaderRecord(
+                        contentKey: ContentKey(rawValue: header.id),
+                        headerId: header.id,
+                        messageId: header.messageId,
+                        subject: header.subject,
+                        from: "\(header.from) <\(header.fromAddress)>",
+                        to: header.to,
+                        cc: header.cc,
+                        bcc: header.bcc,
+                        dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
+                        folderId: header.folderId
+                    )
+                }
+                let inserted = try? await SearchIndex.shared.indexHeaders(records)
+                if let inserted, inserted > 0 {
+                    BackgroundSyncLogger.logDebug("[FTS] Indexed \(inserted) new messages")
+                }
+                // Mark headers as fully indexed
+                let headerIds = records.map(\.headerId)
+                try? await dbPool.write { db in
+                    for hid in headerIds {
+                        try db.execute(
+                            sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
+                            arguments: [hid]
+                        )
+                    }
+                }
+                BackgroundSyncLogger.logDebug("[Sync] \(folder.name): \(result.newHeaders.count) new messages")
+                await ActiveBodyQueue.shared.enqueueBatch(result.newHeaders)
+            }
+            return result.uidMigratedOldIds
+        }
+
+        let uidMigratedOldIds: [String] = try await Task.detached {
+            var allMigratedIds: [String] = []
+            // `!skippablePaths.contains` — Fix B task 4: a CONDSTORE-unchanged non-inbox
+            // folder is not re-fetched (its HIGHESTMODSEQ proves nothing changed). The
+            // reconcile loop below still visits it, so external deletions are never missed.
+            for folder in syncableFolders where !folder.path.isEmpty && !skippablePaths.contains(folder.path) {
+                // T4.S6 re-drive. A folder left quarantined by an interrupted
+                // reaction (crash, transient step failure) BRANCHES INTO the
+                // reaction instead of a normal sync — never a plain skip. The flag
+                // means "re-drive me", and only incidentally "skip normal sync
+                // until then": an ordinary pass here would insert NEW-epoch headers
+                // under the OLD stamp, which is precisely the state a bare-UID
+                // durable op mutates the wrong message from. Launch/foreground full
+                // sync is therefore the re-drive OWNER; `runUidValidityResetReaction`
+                // re-enters at the barrier (idempotent) when the flag is already set.
+                if folder.uidValidityResetPendingAt != nil {
+                    await AccountManager.shared.runUidValidityResetReaction(
+                        accountId: account.id, folderPath: folder.path
+                    )
+                    continue
+                }
+                // The `recentlyCompleted` protection set is NOT read here. It is
+                // read INSIDE `runSyncMessages`'s write transaction — see the note
+                // there and on `AccountManager.liveRecentlyCompleted`.
+                let ft0 = CFAbsoluteTimeGetCurrent()
+                do {
+                    let result = try await Self.runSyncMessages(
+                        for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
+                        dbPool: pool
+                    )
+                    BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
+                    allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
+                } catch {
+                    if Self.isSelectFailedError(error) {
+                        BackgroundSyncLogger.logDebug("[FullSync] SELECT failed for \(folder.name) (\(folder.path)) — skipping: \(error)")
+                        continue
+                    }
+                    if Self.isConnectionError(error) {
+                        // Connection died mid-sync — retry this folder once.
+                        // Pool self-heals: dead connections discarded on checkin(healthy: false),
+                        // next checkout creates a fresh one.
+                        BackgroundSyncLogger.logDebug("[FullSync] Connection error for \(folder.name): \(error) — retrying")
+                        do {
+                            let retryResult = try await Self.runSyncMessages(
+                                for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
+                                dbPool: pool
+                            )
+                            allMigratedIds.append(contentsOf: await processSyncResult(retryResult, folder: folder))
+                        } catch {
+                            if Self.isConnectionError(error) {
+                                // Retry also hit connection error — server unreachable. Skip remaining folders.
+                                BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping remaining folders")
+                                break
+                            }
+                            // Non-connection error on retry — skip this folder, continue with rest
+                            BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping")
+                        }
+                        continue
+                    }
+                    throw error
+                }
+
+                // Anchor oldestSyncedDate for the age cutoff in backfill.
+                // Only set if not already set (backfill or Smart Reindex may have set it).
+                // Query the oldest date from ONLY the most recent N messages
+                // (matching syncMessageLimit), NOT min(date) across all messages —
+                // avoids skipping recent history when old messages already exist.
+                if folder.oldestSyncedDate == nil {
+                    let oldestDate = try await pool.read { db in
+                        try Date.fetchOne(db,
+                            MessageHeader
+                                // Provider order: this anchor feeds Gmail
+                                // `before:` cutoffs, which filter by `internalDate`.
+                                .select(Column("providerDate"))
+                                .filter(Column("folderId") == folder.id)
+                                .order(Column("providerDate").desc)
+                                .limit(1, offset: SyncConfig.syncMessageLimit - 1)
+                        )
+                    }
+                    if let oldestDate {
+                        try await pool.write { db in
+                            _ = try Folder.filter(Column("id") == folder.id)
+                                .updateAll(db, Column("oldestSyncedDate").set(to: oldestDate))
+                        }
+                        BackgroundSyncLogger.logDebug("[FullSync] Anchored oldestSyncedDate for \(folder.name) to \(oldestDate)")
+                    }
+                }
+
+            }
+            return allMigratedIds
+        }.value
+
+        // Clear undo protection for migrated UIDs
+        // UID migration tracking — logged for diagnostics but no longer clears undoProtectedIds
+        // (pending-op check in sync transaction handles undo protection now)
+        if !uidMigratedOldIds.isEmpty {
+            BackgroundSyncLogger.logDebug("[FullSync] UID migrated \(uidMigratedOldIds.count) messages")
+        }
+        BootProfiler.mark("fullSync[\(acctTag)] DONE in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (inbox headers synced)")
+        await SyncEngine.checkpointWALThrottled()
+
+        // ADR-IOS-051 Phase 2: evaluate the deletion-reconcile predicate per
+        // IMAP folder during full sync too — ghosts below the windowed sync's
+        // UID floor are otherwise invisible when delta's STATUS-change gating
+        // skips the folder (the cached totalCount already matches the server).
+        // `folder.totalCount` here is the fresh STATUS count from fetchFolders
+        // above; the local count is read live AFTER the windowed pass.
+        if provider.staleWindowMode == .uid, let imapProvider = provider as? IMAPProvider {
+            for folder in syncableFolders where !folder.path.isEmpty {
+                // T4.S6b — the verified door's SECOND call site, and it is not
+                // redundant with the one in `runSyncMessages`. This loop visits EVERY
+                // syncable folder, INCLUDING the CONDSTORE-quiet ones the per-folder
+                // loop above skipped via `skippablePaths` — a quiet Archive never
+                // reaches `runSyncMessages` at all, so without this its epoch would
+                // stay unproven indefinitely while this very loop is about to consult
+                // it. Running BEFORE the reconcile trigger is what makes the walk's
+                // "epoch unverified" refusal a one-cycle over-refusal rather than a
+                // standing one. A no-op for every folder the loop above already
+                // settled.
+                //
+                // `provider` (not `imapProvider`) is passed on purpose: the seam is a
+                // protocol member, and routing it through a downcast would silently
+                // send every non-`IMAPProvider` conformer that models a bound epoch
+                // down the do-nothing leg.
+                await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
+                    folderId: folder.id, folderPath: folder.path, accountId: account.id,
+                    provider: provider, dbPool: pool)
+                do {
+                    let folderId = folder.id
+                    let localCount = try await pool.read { db in
+                        try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db)
+                    }
+                    if Self.shouldReconcileDeletions(
+                        localCount: localCount,
+                        serverCount: folder.totalCount,
+                        tolerance: SyncConfig.deletionReconcileCountTolerance
+                    ) {
+                        if DebugModeManager.isLoggingEnabled() {
+                            BackgroundSyncLogger.logDebug("[FullSync] \(folder.name): local=\(localCount) > server=\(folder.totalCount) — reconciling external deletions")
+                        }
+                        await reconcileExternallyDeletedMessages(
+                            folder: folder,
+                            provider: imapProvider,
+                            expectedGhosts: localCount - folder.totalCount
+                        )
+                    }
+                } catch {
+                    // Best-effort — the evidence is durable and re-fires next sync.
+                    if DebugModeManager.isLoggingEnabled() {
+                        BackgroundSyncLogger.logDebug("[FullSync] reconcile trigger check failed for \(folder.name): \(error)")
+                    }
+                }
+            }
+        }
+
+        // Body fetching happens during backfill (startBackfill called after fullSync).
+        // Running it inline here would block sync and explode memory for large folders.
+        // Unread recount is now handled per-folder inside syncMessages, immediately after header commit.
+    }
+
+    // MARK: - Message Sync
+
+    /// On-demand sync for a single folder (called when user navigates to it).
+    /// Publishes `.checking` phase for the folder's account.
+    func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws {
+        // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
+        // non-favourite folder. `fullSync`'s per-folder loop and `imapDeltaSync`
+        // both branch into the reaction for a quarantined folder, but both iterate
+        // `syncableFolders` (primary ∪ secondary ∪ favourite), so a quarantined
+        // custom folder previously had NO re-drive at all: `runSyncMessages`'s
+        // in-transaction quarantine term correctly SKIPS the merge pass and
+        // `isFolderWalkComplete` refuses the crawl, which together left the folder
+        // quarantined and unsynced FOREVER — the reaction's own abort legs
+        // deliberately leave the flag set precisely because a re-drive is assumed
+        // to exist. On-demand navigation is that folder's only door
+        // (`AccountManager.syncFolders(_:)` → here → `runSyncMessages`, whose
+        // filter is `!folder.path.isEmpty` and nothing else), so the branch belongs
+        // here. Re-read the flag rather than trusting the caller's snapshot — the
+        // caller's `Folder` may predate an arm by an arbitrary interval.
+        //
+        // No recursion through step 6: the reaction releases and resyncs only AFTER
+        // step 5 cleared the flag in the same write that stamped the fresh epoch, so
+        // the re-read below is nil by then. An abort leg returns before step 6 runs
+        // at all, and `runUidValidityResetReaction` is single-flight regardless.
+        let quarantined = (try? await dbPool.read { [folderId = folder.id] db in
+            try Folder.fetchOne(db, key: folderId)?.uidValidityResetPendingAt != nil
+        }) ?? false
+        if quarantined {
+            await AccountManager.shared.runUidValidityResetReaction(
+                accountId: folder.accountId, folderPath: folder.path
+            )
+            return
+        }
+        Task { @MainActor in AccountManagerState.shared.setSyncPhase(.checking, forAccount: folder.accountId) }
+        try await syncMessages(for: folder, provider: provider, limit: SyncConfig.syncMessageLimit)
+        // Unread recount is now handled inside syncMessages, immediately after header commit.
+
+        // Self-heal runs during periodic background sync, not on pull-to-refresh.
+        // Running a 90-day IMAP SEARCH here blocks the UI spinner unnecessarily.
+    }
+
+    /// Instance wrapper for syncMessages — captures MainActor state and delegates
+    /// to the static method, then handles MainActor-only cleanup (undo protection, FTS).
+    /// Used by syncFolderMessages and delta sync paths that run on MainActor.
+    func syncMessages(
+        for folder: Folder,
+        provider: any EmailProvider,
+        limit: Int
+    ) async throws {
+        let result = try await Self.runSyncMessages(
+            for: folder, provider: provider, limit: limit,
+            dbPool: dbPool
+        )
+
+        if !result.uidMigratedOldIds.isEmpty {
+            BackgroundSyncLogger.logDebug("[FullSync] syncMessages — UID migrated \(result.uidMigratedOldIds.count) messages")
+        }
+
+        await Self.publishHeaderRekeys(result.headerRekeys)
+
+        // ReplyDetect: notify UI immediately so tag badges update.
+        ReplyParentResolver.postParentNotifications(result.replyDetectIds)
+
+        // Recount unread immediately after headers are committed to GRDB —
+        // don't wait for FTS indexing and body queue (which can take seconds).
+        // Always recount: runSyncMessages may update flags on existing messages
+        // (read→unread) without producing newHeaders or staleIds.
+        await UnreadCountManager.shared.requestRecount(folderId: folder.id)
+
+        if !result.ftsRekeys.isEmpty {
+            // In-place FTS re-key (UID remap / remnant canonicalization) —
+            // preserves the indexed body text + embedding under the new id.
+            try? await SearchIndex.shared.rekeyHeaders(result.ftsRekeys.map {
+                (oldKey: ContentKey(rawValue: $0.oldId), newKey: ContentKey(rawValue: $0.newId),
+                 newMessageId: $0.newMessageId)
+            })
+        }
+        if !result.staleIds.isEmpty {
+            removeHeadersFromFTS(result.staleIds)
+        }
+        if !result.newHeaders.isEmpty {
+            await indexHeadersForFTS(result.newHeaders)
+            BackgroundSyncLogger.logDebug("[Sync] \(folder.name): \(result.newHeaders.count) new messages")
+            await ActiveBodyQueue.shared.enqueueBatch(result.newHeaders)
+        }
+    }
+
+    // MARK: - Background Sync Helpers
+
+    /// Keep active view-local identities coherent with a committed sync re-key.
+    /// Once publication reaches MainActor, delivery is synchronous so the model
+    /// and view-owned bindings apply the same committed transition before the
+    /// publisher returns.
+    private static func publishHeaderRekeys(_ records: [HeaderRekeyRecord]) async {
+        guard !records.isEmpty else { return }
+        await MainActor.run {
+            NotificationCenter.default.post(name: .messageHeadersRekeyed, object: records)
+        }
+    }
+
+    /// Result from per-folder message sync. All fields are Sendable for cross-isolation transfer.
+    struct SyncMessagesResult: Sendable {
+        let newHeaders: [MessageHeader]
+        let staleIds: [String]
+        let replyDetectIds: [String]
+        let uidMigratedOldIds: [String]
+        /// Header re-keys (UID remap, remnant canonicalization) — callers must
+        /// apply via `SearchIndex.rekeyHeaders` so the FTS rowid (indexed body
+        /// text + messages_vec embedding) moves to the new id IN PLACE.
+        /// `newMessageId` refreshes the FTS msgId column on UID remaps.
+        let ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]
+        /// Exact committed UID-remap mappings for active view-local identities.
+        /// This is intentionally narrower than `ftsRekeys`: canonicalization
+        /// carriers without a new provider id cannot update a visible snapshot.
+        let headerRekeys: [HeaderRekeyRecord]
+    }
+
+    /// Canonicalize the local rows for one remote message in one folder.
+    ///
+    /// `optimisticMoveToFolder` updates folderId/folderPath but keeps the
+    /// original PK ("accountId:<oldPath>:<messageId>"). For providers with
+    /// stable message ids (Gmail) the remnant's messageId stays in the remote
+    /// set forever, so it never reaches the stale/UID-remap path that re-keys
+    /// IMAP rows — the stale PK survives indefinitely, and historical insert
+    /// paths could leave BOTH the remnant AND a canonical-PK row for the same
+    /// message (observed in the field 2026-06-09 as phantom 2-member
+    /// self-threads in Trash; see PROJECT_MEMORY).
+    ///
+    /// Merges any duplicates into one survivor (preferring the canonical-PK
+    /// row, preserving AI fields and the richest cached body) and re-keys the
+    /// survivor to the canonical PK. Returns the canonical row (nil when the
+    /// message has no local row yet), the header ids of merge-loser rows
+    /// deleted along the way (callers must drop them from FTS via staleIds),
+    /// and the (oldId, newId) pair when a re-key happened (callers must
+    /// re-key the FTS entry IN PLACE via `SearchIndex.rekeyHeaders` — this
+    /// preserves the FTS rowid, the indexed body text, and the messages_vec
+    /// embedding; the re-keyed old id must NOT ride the staleIds channel).
+    ///
+    /// `bodyComplete` stays truthful per row: the survivor keeps its OWN flag
+    /// (no OR-merge from losers — that would claim an FTS body the survivor's
+    /// row doesn't have, the PLAN_FTS_BODY_LOSS class). A survivor with
+    /// `bodyComplete = 0` re-enters the standard body pipeline naturally.
+    ///
+    /// `v2final` supplies the merge/delete/re-key control-flow shape, but its
+    /// RFC Message-ID discriminator is deliberately SUBTRACTED: RFC equality
+    /// does not prove a provider address. For an IMAP row the proof is the
+    /// exact canonical `(account, folder, UID)` key plus equality between the
+    /// row's T2.5 source observation and the epoch returned beside this pass's
+    /// serving FETCH. Stable-id providers need no epoch and retain the existing
+    /// canonicalization behavior.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED: `providerAddressOwnershipProven` is the
+    /// minimum provider-native proof absent from v2final after the Header,
+    /// Snapshot, ingress/re-key call-site, and SyncEngineFullSync history
+    /// census. An optimistic cross-mailbox row cannot satisfy it. Such a row is
+    /// left in place with a nil observation stamp. No RFC adoption, no
+    /// compatibility shim, and no Folder-current epoch synthesis is performed
+    /// here.
+    ///
+    /// ⚠️ **"Sync may reconcile it later" was the unverified half of that claim
+    /// and it is now stated precisely, because it decides whether a refusal
+    /// hides a message.** When the refused rows are the ONLY rows at this
+    /// address, returning one of them makes the caller take its
+    /// `sourceAddressProven` arm, which `continue`s BEFORE the insert — so the
+    /// message the server just reported is neither merged nor inserted, and
+    /// nothing else re-offers it: `selectStaleHeaders` cannot reach the remnant
+    /// (its UID is in `remoteIds` on all three arms) and
+    /// `SyncEngine`'s `missingUIDs` is keyed on
+    /// (folderId, messageId), so the remnant answers for the UID and the deep
+    /// crawl never re-fetches it. `incomingRfc822Identity` is what lets this
+    /// function tell "a retained row might BE this message" (keep refusing)
+    /// apart from "every retained row provably is NOT" (admit the insert) —
+    /// see the refusal path for the gate and its fail directions.
+    ///
+    /// - Parameter incomingRfc822Identity: the NORMALIZED RFC 822 identity of
+    ///   the message this pass is offering (`normalizedRfc822Identity`), or nil
+    ///   when the envelope carries none. Used ONLY as a negative discriminator
+    ///   in the refusal path; nil is the fail-closed value everywhere.
+    nonisolated static func canonicalizeLocalRows(
+        accountId: String,
+        folderPath: String,
+        folderId: String,
+        messageId: String,
+        isInInbox: Bool,
+        windowMode: StaleWindowMode,
+        sourceBoundEpoch: Int?,
+        incomingRfc822Identity: String?,
+        db: Database
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool) {
+        let allRows = try MessageHeader
+            .filter(Column("messageId") == messageId && Column("folderId") == folderId)
+            .fetchAll(db)
+        guard !allRows.isEmpty else { return (nil, [], nil, false) }
+
+        let canonicalId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: messageId)
+
+        let proofs = allRows.map {
+            providerAddressOwnershipProven(
+                row: $0, accountId: accountId, folderPath: folderPath,
+                folderId: folderId, messageId: messageId,
+                canonicalId: canonicalId, windowMode: windowMode,
+                sourceBoundEpoch: sourceBoundEpoch)
+        }
+        var retainedRows = allRows
+        for index in retainedRows.indices where !proofs[index] && retainedRows[index].observedUidValidity != nil {
+            retainedRows[index].observedUidValidity = nil
+            try retainedRows[index].update(db)
+        }
+        let rows = zip(retainedRows, proofs).compactMap { element in
+            element.1 ? element.0 : nil
+        }
+        guard !rows.isEmpty else {
+            // No retained row owns this provider address. The disposition below
+            // decides whether the message the server just reported ever becomes
+            // visible, so it is gated on POSITIVE evidence of non-identity and
+            // never on the mere absence of proof.
+            //
+            // Admit the caller's ordinary INSERT (return nil) only when:
+            //   * the incoming envelope carries an identity, AND
+            //   * every retained row carries one and every one of them DIFFERS,
+            //     AND
+            //   * no retained row already holds the canonical PK.
+            // Then no retained row can be this message, and refusing would hide
+            // it permanently (see this function's doc comment for why neither
+            // healer reaches it).
+            //
+            // Same direction and same rationale as the R15-F1 identity gate on
+            // the pre-sync inbox reclaim in `runSyncMessages`: RFC EQUALITY
+            // never proves a provider address — that discriminator stays
+            // subtracted — but RFC INEQUALITY does prove two rows are not the
+            // same message. Every ambiguous shape keeps the refusal: a nil
+            // identity on either side, an equal identity, or an occupied
+            // canonical PK. The occupied-PK arm also keeps the insert away from
+            // a PK it could not take.
+            //
+            // The admitted row is not a duplicate of the retained ones and
+            // cannot become a wrong-message mutation target: the insert stamps
+            // `observedUidValidity = sourceBoundEpoch` while an optimistic
+            // remnant's stamp is nil, and `admittedOrdinaryActionTargets`
+            // admits a gesture only when `observedUidValidity == liveEpoch`, so
+            // the remnant stays exactly as gesture-inert as it was before.
+            let admitIncomingAsNewRow: Bool = {
+                guard let incoming = incomingRfc822Identity,
+                      !retainedRows.contains(where: { $0.id == canonicalId })
+                else { return false }
+                return retainedRows.allSatisfy { row in
+                    guard let stored = normalizedRfc822Identity(row.rfc822MessageId) else { return false }
+                    return stored != incoming
+                }
+            }()
+            BackgroundSyncLogger.log("[Sync] canonicalize REFUSED at (folderId=\(folderId), msgId=\(messageId)) — no row proves provider-address ownership; the incoming message is \(admitIncomingAsNewRow ? "ADMITTED as a new row (every retained row provably denotes a different message)" : "NOT admitted (no positive evidence of non-identity)")")
+            if admitIncomingAsNewRow { return (nil, [], nil, false) }
+            return (retainedRows.first(where: { $0.id == canonicalId }) ?? retainedRows[0], [], nil, false)
+        }
+        // Fast path — a single row already under the canonical PK is the
+        // overwhelmingly common case. Return before ANY extra query so the
+        // per-message cost of the upsert loop is identical to the plain
+        // fetchOne this replaced (ADR-IOS-029 hot-path discipline).
+        if rows.count == 1 && rows[0].id == canonicalId {
+            return (rows[0], [], nil, true)
+        }
+
+        var survivor = rows.first(where: { $0.id == canonicalId }) ?? rows[0]
+        let survivorHadObservedEpoch = survivor.observedUidValidity != nil
+        // T2.5/T5.4: duplicate merging and re-keying do not prove that the
+        // survivor belongs to this provider address space. T5.11 owns that
+        // proof; until then canonicalization always clears source authority.
+        survivor.observedUidValidity = nil
+        var removedIds: [String] = []
+
+        // Preserve the richest cached body across all rows BEFORE any delete. Each
+        // loser's body row is then deleted EXPLICITLY where its header goes: Stage D
+        // (`v70_dropMessageBodyHeaderFK`) removed the cascade that used to do it,
+        // and leaving them behind would mean one leaked body per merged duplicate.
+        // These are value copies, so deleting the rows does not disturb `bestBody`.
+        var bestBody: MessageBody?
+        for row in rows {
+            if let body = try MessageBody.fetchOne(db, key: row.id),
+               bestBody == nil || (bestBody?.htmlContent?.isEmpty ?? true) {
+                bestBody = body
+            }
+        }
+
+        // Merge AI/local state from duplicates into the survivor, then drop them.
+        for row in rows where row.id != survivor.id {
+            if survivor.actionTag == nil, let tag = row.actionTag {
+                survivor.actionTag = tag
+                survivor.tagSortOrder = row.tagSortOrder
+            }
+            if survivor.summaryBlurb == nil { survivor.summaryBlurb = row.summaryBlurb }
+            if survivor.summaryTodos == nil { survivor.summaryTodos = row.summaryTodos }
+            if survivor.reminderDate == nil { survivor.reminderDate = row.reminderDate }
+            if survivor.reminderTime == nil { survivor.reminderTime = row.reminderTime }
+            if survivor.reminderContent == nil { survivor.reminderContent = row.reminderContent }
+            if survivor.cachedReply == nil { survivor.cachedReply = row.cachedReply }
+            survivor.isReplied = survivor.isReplied || row.isReplied
+            survivor.isForwarded = survivor.isForwarded || row.isForwarded
+            survivor.isRead = survivor.isRead || row.isRead
+            // Deliberately NOT merging bodyComplete/bodyEmptyConfirmed — the
+            // survivor's flags must describe its OWN FTS row, and the losers'
+            // FTS rows leave via staleIds.
+            try row.delete(db)
+            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: row.id))
+            removedIds.append(row.id)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Sync] Canonicalize: merged duplicate \(row.id) into \(survivor.id) (msgId=\(messageId))")
+            }
+        }
+
+        let willRekey = survivor.id != canonicalId
+        if willRekey || !removedIds.isEmpty {
+            // Normalize folder-derived state while we're writing anyway.
+            survivor.isInInbox = isInInbox
+        }
+
+        var ftsRekey: (oldId: String, newId: String)?
+        if willRekey {
+            // Defensive — the canonical PK can be held by a row in ANOTHER
+            // folder (a message optimistically moved OUT of this folder keeps
+            // its PK). Don't steal it; keep the remnant PK and retry on a
+            // later sync once that row has been canonicalized in its own folder.
+            guard try MessageHeader.fetchOne(db, key: canonicalId) == nil else {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
+                }
+                if !removedIds.isEmpty || survivorHadObservedEpoch { try survivor.update(db) }
+                return (survivor, removedIds, nil, true)
+            }
+            // Re-key the optimistic-move remnant to the canonical PK. (The FK that
+            // used to FORBID a PK `UPDATE` here is gone as of Stage D, but converting
+            // this leg to an `UPDATE` is deliberately NOT part of that change — it is
+            // a behaviour change riding a schema commit.)
+            //
+            // 🚨 R17-1 — THE CARRIER IS SHARED, NOT HAND-ROLLED. This block used to
+            // run its own `delete` → reassign `id` → `insert`, which is a header
+            // PRIMARY-KEY change, so it is a member of the class *"every code path
+            // that changes a header's primary key"* — and it had the same gap
+            // `BackfillBodyQueue.rekeyRemappedHeader` and
+            // `DraftStore.migrateExactPlaceholder` had. `survivor.delete(db)` fires
+            // `ON DELETE CASCADE` on BOTH surviving children of `messageHeader`, and
+            // the re-insert restored NEITHER:
+            //   * `messageUserLabel` (`AppDatabase` `v82`'s create, cascade on the
+            //     `messageId` FK) — every label the user applied, destroyed with NO
+            //     rebuild source. Nothing else in the database knows which labels the
+            //     user chose.
+            //   * `messageReference` (`AppDatabase` `v27`'s create, cascade on the
+            //     `messageHeaderId` FK) — the message's threading edges. The
+            //     existing-row merge branch in `runSyncMessages` updates
+            //     `referencesJSON` but never calls
+            //     `ThreadUtils.insertMessageReferences`, so nothing rebuilt them
+            //     either, and the message fell out of its own conversation.
+            // `MessageHeaderRekey.apply` is the sibling carrier — the very sequence
+            // this file's own UID-remap block runs — which carries the labels and
+            // rebuilds the references from the migrated header's own content.
+            //
+            // ⚠️ THE SURVIVOR ONLY, AND THAT BOUND IS LOAD-BEARING (`MIS-005`). The
+            // merge loop ABOVE deletes duplicate LOSERS, and their cascade loss is
+            // INTENDED — they are being discarded, not re-addressed. Only the
+            // survivor's delete+reinsert is an address change wearing a deletion's
+            // clothes. Carrying every loser's children onto the survivor would let
+            // distinct duplicates donate unrelated labels to it: misattribution, and
+            // strictly worse than the bug this closes.
+            //
+            // The BODY is deliberately left for the `bestBody` reattachment below
+            // rather than carried by `apply`: that reattachment picks the RICHEST
+            // body across every merged row, which is strictly more than the
+            // survivor's own. Deleting the survivor's body row FIRST leaves `apply`'s
+            // carry-forward nothing to find, so the selection below stays the sole
+            // body writer and the pre-existing behaviour is preserved exactly.
+            let oldId = survivor.id
+            _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
+            var migrated = survivor
+            migrated.id = canonicalId
+            migrated.folderPath = folderPath
+            guard try MessageHeaderRekey.apply(from: survivor, to: migrated, db: db) else {
+                // UNREACHABLE at this revision, and kept as a live arm rather than
+                // discarded so a future reordering degrades instead of corrupting.
+                // `apply` returns false only when `canonicalId` is already occupied,
+                // which the guard above refused inside THIS write transaction, and
+                // GRDB serializes writers. `apply` deletes before its own collision
+                // return, so `oldId` now names no header at all — it rides
+                // `removedIds`, the caller's "this id is gone, drop its FTS entry"
+                // channel, and must NOT ride `ftsRekey`, which would file the index
+                // under a row that was never inserted.
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] Canonicalize: re-key \(oldId) → \(canonicalId) COLLIDED — old row is gone")
+                }
+                removedIds.append(oldId)
+                return (try MessageHeader.fetchOne(db, key: canonicalId), removedIds, nil, true)
+            }
+            survivor = migrated
+            ftsRekey = (oldId: oldId, newId: canonicalId)
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Sync] Canonicalize: re-keyed remnant \(oldId) → \(canonicalId)")
+            }
+        } else if !removedIds.isEmpty {
+            try survivor.update(db)
+        }
+
+        // Reattach the preserved body under the final id if none is present.
+        if let body = bestBody, try MessageBody.fetchOne(db, key: ContentKey(rawValue: survivor.id)) == nil {
+            var rekeyedBody = body
+            rekeyedBody.id = ContentKey(rawValue: survivor.id)
+            try rekeyedBody.insert(db)
+        }
+
+        return (survivor, removedIds, ftsRekey, true)
+    }
+
+    /// ⚑ NO REFERENCE — INVENTED: minimum proof that a local row owns the
+    /// provider address offered by this sync pass. The exact `v2final`
+    /// canonicalizer has only an RFC discriminator and no persisted header
+    /// observation epoch. See `canonicalizeLocalRows` for the census boundary.
+    nonisolated static func providerAddressOwnershipProven(
+        row: MessageHeader,
+        accountId: String,
+        folderPath: String,
+        folderId: String,
+        messageId: String,
+        canonicalId: String,
+        windowMode: StaleWindowMode,
+        sourceBoundEpoch: Int?
+    ) -> Bool {
+        guard row.accountId == accountId, row.messageId == messageId else { return false }
+        switch windowMode {
+        case .date:
+            return true
+        case .uid:
+            guard let sourceBoundEpoch, sourceBoundEpoch > 0 else { return false }
+            guard row.folderId == folderId, row.folderPath == folderPath else { return false }
+            // The direct canonical-PK hit is the existing T2.5 bound-observation
+            // path. A non-canonical row may join it only when its persisted
+            // source observation already matches this serving FETCH.
+            return row.id == canonicalId || row.observedUidValidity == sourceBoundEpoch
+        }
+    }
+
+    /// SINGLE SOURCE OF TRUTH for "which local rows may be stale-deleted after a
+    /// WINDOWED fetch". Pure + deterministic so production sync and the test harness
+    /// share one rule that cannot drift.
+    ///
+    /// Invariant: a windowed fetch (newest `limit` rows) gives COMPLETE remote
+    /// knowledge ONLY for the slice it covered, measured in the provider's
+    /// fetch-ordering dimension:
+    ///   - `.uid` (IMAP): the fetch returns the highest UIDs. UID == archive-time,
+    ///     DECORRELATED from message `date` — archiving an old email assigns it a
+    ///     fresh high UID with an old date. A DATE floor is dragged backwards by one
+    ///     such message and sweeps in months of mid-range mail the fetch never
+    ///     returned → mass false stale-deletion (the "Archive month-gap" data-loss
+    ///     bug). Bound by UID: never delete a row whose UID is below the smallest
+    ///     fetched UID — it was outside the window.
+    ///   - `.date` (Gmail/Exchange): fetch is most-recent-by-date, so a date floor IS
+    ///     the covered slice (and their ids aren't numeric UIDs anyway).
+    ///
+    /// 🚨 **COMPLETE KNOWLEDGE IS `coverage.spansEntireFolder` — A STATEMENT THE
+    /// SERVER MADE — AND NEVER A COUNT OF WHAT WE MATERIALISED.** This branch used
+    /// to read `fetched.count < limit`, and `fetched` is the post-`compactMap`
+    /// SURVIVOR array of a `fetchMessages` implementation that drops every record
+    /// it cannot parse (`IMAPProvider.mapMessageInfo`,
+    /// `ExchangeProvider.parseGraphMessage`, `GmailProvider`'s task group). One
+    /// malformed sibling in a FULL window therefore read as "the whole folder came
+    /// back", and this branch has NO floor: every local row the fetch never went
+    /// near was classified stale and deleted with its FTS entry. That is the
+    /// ADR-IOS-042 / MIS-IOS-002 mass-deletion shape reached through a different
+    /// door, and it is not recoverable — `selfHealRecentMessages` covers 90 days
+    /// and the deep crawl only re-walks folders with `backfillComplete == false`.
+    /// The fix is honest evidence, NOT a narrower blast radius: adding a floor here
+    /// would degenerate this branch into the windowed one and destroy its purpose
+    /// (deleting rows BELOW the window that the server dropped long ago).
+    /// `v2final` (`e28dd4edb`) carries the identical `fetched.count < limit` defect
+    /// in the identical function — it is a floor here, not a ceiling.
+    ///
+    /// `coverage.unmaterialisedIds` join `remoteIds` for the same reason in reverse:
+    /// the server NAMED those messages, so they are PRESENT. A record we could not
+    /// parse must never read as "the server no longer has it".
+    ///
+    /// **PRESENCE and COVERAGE are two different questions, and `\Deleted` answers
+    /// only the first (`IOS-IMAP-001` / D3).** A message the server reports with
+    /// `\Deleted` is pending removal (RFC 3501 §2.3.2) and is not presented, so it
+    /// does not keep a local row alive — it is subtracted from `remoteIds` below.
+    /// It is NOT subtracted from `fetched.count` or from the UID floor: those
+    /// measure what the FETCH covered, and a `\Deleted` record was covered. Taking
+    /// this flag into the window instead of into presence would raise the floor
+    /// (or trip the complete-knowledge branch) and stale-delete rows the fetch
+    /// never returned — the ADR-IOS-042 / MIS-IOS-002 Archive data-loss shape.
+    nonisolated static func selectStaleHeaders(
+        candidates: [MessageHeader],
+        fetched: [MessageHeaderInfo],
+        coverage: FetchCoverage,
+        windowMode: StaleWindowMode
+    ) -> [MessageHeader] {
+        let remoteIds = Set(fetched.lazy.filter { !$0.isDeletedOnServer }.map(\.messageId))
+            .union(coverage.unmaterialisedIds)
+        if coverage.spansEntireFolder {
+            return candidates.filter { !remoteIds.contains($0.messageId) }
+        }
+        switch windowMode {
+        case .uid:
+            // The floor is taken over MATERIALISED records only. A record we could
+            // not parse would only ever LOWER it, widening the candidate set — the
+            // fail-dangerous direction — while a higher floor merely defers a
+            // deletion to a later pass. Fail closed.
+            guard let floorUID = fetched.compactMap({ Int64($0.messageId) }).min() else { return [] }
+            return candidates.filter { row in
+                guard let uid = Int64(row.messageId) else { return false } // non-numeric id → never UID-stale
+                return uid >= floorUID && !remoteIds.contains(row.messageId)
+            }
+        case .date:
+            // PROVIDER ORDER, not display order. Gmail pages by `internalDate`,
+            // and on Gmail `date` is the top `Received:` timestamp, which can
+            // sit WEEKS after `internalDate` for Google-relayed mail. A window
+            // keyed on `date` would admit a row whose arrival date is inside
+            // the window but whose `internalDate` is below the page's floor —
+            // absent from the page for that reason alone — and delete it. Same
+            // decorrelation ADR-IOS-042 keys IMAP by UID for. Graph's
+            // `receivedDateTime` is both keys, so nothing changes there.
+            guard let floorDate = fetched.map(\.providerOrderDate).min() else { return [] }
+            return candidates.filter { $0.providerDate >= floorDate && !remoteIds.contains($0.messageId) }
+        }
+    }
+
+    /// The identity an rfc822 Message-ID column carries, or nil when it carries
+    /// NONE. Normalized (angle brackets/whitespace stripped) so a stored
+    /// `<a@example.com>` and an incoming `a@example.com` are the same identity,
+    /// and empty-after-normalization collapses to nil — an empty string is the
+    /// absence of an identity, not a distinct one.
+    ///
+    /// One helper rather than the reference's four inlined copies of
+    /// `.map(EmailFilter.normalizeMessageId).flatMap { $0.isEmpty ? nil : $0 }`
+    /// (`v2final:669-673, 685-690, 1946-1951, 2350-2355`): every §5 site must
+    /// agree on what "same identity" means, and four copies are four chances
+    /// for one to drift.
+    nonisolated static func normalizedRfc822Identity(_ raw: String?) -> String? {
+        raw.map(EmailFilter.normalizeMessageId).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Which of `remoteIds` are NEW (not already present locally in `folderId`) —
+    /// i.e. `remoteIds − localIdsInFolder`. Feeds UID-remap detection in `runSyncMessages`.
+    ///
+    /// `newRemoteIds` only ever subtracts from `remoteIds`, so intersecting the local
+    /// set with `remoteIds` FIRST is byte-identical to loading the whole folder and
+    /// subtracting (`remoteIds − local ≡ remoteIds − (local ∩ remoteIds)`) — but WITHOUT
+    /// materializing tens of thousands of rows for a huge folder (All Mail; the old
+    /// unbounded `SELECT messageId WHERE folderId = ?` was ~7s of write execution INSIDE
+    /// the writer). When the caller already loaded the full local-id set for stale
+    /// detection (`cachedLocalIds`, the small-folder branch), reuse it; otherwise do a
+    /// bounded, chunked membership check (same idiom as `SyncEngineSelfHeal`).
+    ///
+    /// `messageId` IS the UID for IMAP — this is pure exact membership, with NO date/UID
+    /// window, so it does NOT touch stale-window semantics (ADR-IOS-042-safe). Empty
+    /// `remoteIds` is a valid no-op (the loop doesn't run; returns empty) — this is why
+    /// the query builder is used over a raw `IN (…)`, which would be invalid SQL for an
+    /// empty list.
+    nonisolated static func newRemoteIds(
+        in db: Database,
+        folderId: String,
+        remoteIds: Set<String>,
+        cachedLocalIds: Set<String>?
+    ) throws -> Set<String> {
+        if let cached = cachedLocalIds {
+            return remoteIds.subtracting(cached)
+        }
+        let sqlChunkSize = SyncConfig.sqlChunkSize
+        let remoteArr = Array(remoteIds)
+        var existingLocalIds = Set<String>()
+        for start in stride(from: 0, to: remoteArr.count, by: sqlChunkSize) {
+            let end = min(start + sqlChunkSize, remoteArr.count)
+            let chunk = Array(remoteArr[start..<end])
+            let found = try String.fetchSet(db,
+                MessageHeader
+                    .select(Column("messageId"))
+                    .filter(Column("folderId") == folderId && chunk.contains(Column("messageId")))
+            )
+            existingLocalIds.formUnion(found)
+        }
+        return remoteIds.subtracting(existingLocalIds)
+    }
+
+    /// Core message sync logic — runs entirely off the main thread.
+    /// Fetches messages from provider, performs stale detection + upsert in a single
+    /// DB write transaction. No MainActor state accessed.
+    nonisolated static func runSyncMessages(
+        for folder: Folder,
+        provider: any EmailProvider,
+        limit: Int,
+        dbPool: PrioritizedDatabase
+    ) async throws -> SyncMessagesResult {
+        // T1.2b — SELECT-sourced epoch capture, BOUND to this pass's own fetch.
+        // `fetchMessagesWithObservedEpoch` SELECTs the folder
+        // (`IMAPProvider.selectMailboxTracked`) and hands back the UIDVALIDITY
+        // that same `Mailbox.Selection` reported, so nothing can get between the
+        // two. `OK [UIDVALIDITY n]` is core IMAP4rev1, NOT a UIDPLUS extension —
+        // so on a non-UIDPLUS server, where the STATUS-sourced writes T1.2 added
+        // see nil forever, this is the epoch source that still answers. (The
+        // deletion-reconcile walk's own SELECT is the other one, but it only runs
+        // on a count mismatch, so it is not a backstop.) nil for every non-IMAP
+        // provider (protocol default), and nil — never a previous SELECT's
+        // value — when the SELECT that served this fetch reported no UIDVALIDITY.
+        //
+        // 🚨 ROUND 10 — this used to read the shared
+        // `provider.lastObservedUidValidity(folderPath:)` mirror right after the
+        // fetch, and that was a REGRESSION the moment round 8 routed the backfill
+        // walk's three SELECTs through the tracked chokepoint: the walk's
+        // `getUidNext`/`searchExistingUIDs`/`fetchMessageHeaders` — and, through
+        // that last one, self-heal and deep backfill, neither of them
+        // epoch-guarded — all replace the mirror for this same folder path. One
+        // of them landing between the fetch and the read let this pass bootstrap
+        // the LIVE epoch while merging the PREVIOUS one's headers, which is the
+        // stamp-agrees-with-live-server-over-old-rows state that disarms the
+        // ADR-IOS-051 deletion-reconcile abort guard — the mass-deletion failure
+        // this whole train exists to prevent, relocated into another consumer.
+        //
+        // REFERENCE (`v2final`, tag `e28dd4edb`): the same capture at the same
+        // point of the same function reads the MIRROR
+        // (`let observedEpochAtFetch = provider.lastObservedUidValidity(folderPath:)`),
+        // and it is sound there: its consumer is the §5.5 in-transaction
+        // COMPARISON that abandons the entire merge pass on disagreement, so a
+        // race can only force a false MISMATCH (abort), never a false match — the
+        // reference's own comment argues exactly that. v3 has not ported §5.5
+        // (T4.S6), so here the value feeds a bootstrap WRITE, where the identical
+        // race is fail-dangerous. The mechanism does NOT transfer across that
+        // inversion of consumer direction; the binding below replaces it.
+        // T4.S6b — the VERIFIED door, BEFORE the fetch. A folder that already holds
+        // rows under a nil epoch can no longer be stamped by assertion (the blind
+        // writers all carry a `NOT EXISTS (… messageHeader …)` term now), so this is
+        // where such a folder either EARNS its epoch — by FETCHing a sample of its own
+        // stored UIDs and finding at least one whose RFC-822 Message-ID still answers
+        // there — or gets quarantined for the purge-and-resync reaction.
+        //
+        // The ordering is deliberate: by the time the in-transaction guards below run,
+        // the folder is either stamped (guard (b) proceeds normally) or quarantined
+        // (guard (a) skips this pass and the reaction owns it). It is a no-op — one
+        // small read, no network — for every folder that already has an epoch, holds
+        // no rows, or is already quarantined, which is the steady state.
+        await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
+            folderId: folder.id, folderPath: folder.path, accountId: folder.accountId,
+            provider: provider, dbPool: dbPool)
+        let fetched = try await provider.fetchMessagesWithObservedEpoch(
+            folder: folder.path, limit: limit, offset: 0)
+        let messages = fetched.messages
+        // COVERAGE — what the SERVER said about the window, bound to this fetch and
+        // computed before any client-side narrowing. Every "did we see the whole
+        // folder?" decision below reads THIS, never `messages.count`. See
+        // `FetchCoverage` and `selectStaleHeaders`.
+        let coverage = fetched.coverage
+        let observedEpochAtFetch = fetched.observedEpoch
+        let sourceBoundEpoch = observedEpochAtFetch.flatMap { epoch in
+            epoch > 0 ? Int(exactly: epoch) : nil
+        }
+        let folderPath = folder.path
+        let folderId = folder.id
+        let accountId = folder.accountId
+        let isInInbox = folder.role == .inbox
+
+        // IOS-IMAP-001 / D3 — a `\Deleted` remote message is NOT PRESENT for
+        // display. RFC 3501 §2.3.2 defines the flag as "deleted for removal by
+        // later EXPUNGE": still on the server, still holding its UID, pending
+        // removal. On a server without UIDPLUS that is exactly what a completed
+        // move leaves behind (`IMAPProvider.move` soft-deletes the source and the
+        // purge stays gated on `COPYUID`), and ingesting it as an ordinary message
+        // re-listed it in the Inbox after the protections expired.
+        //
+        // `messages` itself is deliberately NOT filtered. Every windowing decision
+        // below — the `CAST(messageId AS INTEGER)` floor and `selectStaleHeaders`'
+        // own floor — must keep measuring the whole fetch, because they describe
+        // WHAT THE FETCH COVERED. Shrinking the fetch here would raise the floor
+        // and stale-delete rows the fetch never returned (ADR-IOS-042 /
+        // MIS-IOS-002). The complete-knowledge decision no longer reads `messages`
+        // at all — it reads `coverage.spansEntireFolder`, which the provider
+        // derived from the server's own EXISTS/page size.
+        let deletedRemoteIds = Set(messages.lazy.filter(\.isDeletedOnServer).map(\.messageId))
+        // Presence, not coverage: the id set every "does the server still have
+        // this?" question is answered from. Feeds the UID-remap target map, so a
+        // `\Deleted` UID can also never become the destination of a re-key.
+        let remoteIds = Set(messages.lazy.filter { !$0.isDeletedOnServer }.map(\.messageId))
+
+        // Stale detection + deletion + upsert in one write block.
+        // Pending ops are loaded INSIDE the write transaction to prevent TOCTOU races
+        // (a user action inserting a PendingOperation between a separate read and this write
+        // would cause the pendingDestructiveIds set to be stale, leading to UNIQUE constraint violations).
+        // DIAGNOSTIC (debug-gated): time this per-folder write. The merge waits ≤ ONE
+        // in-flight write (DatabaseWriteQueue can't preempt SQLite), so a single long
+        // folder write here is the residual cap to chunk. Remove once confirmed bounded.
+        let writeStart = CFAbsoluteTimeGetCurrent()
+        let syncResult: (newHeaders: [MessageHeader], staleIds: [String], replyDetectIds: [String], uidMigratedOldIds: [String], ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)], headerRekeys: [HeaderRekeyRecord], upsertLine: String?) = try await dbPool.write { db in
+            // ⚠ PRE-EXISTING HAZARD, deliberately NOT closed by T1.2 and tracked
+            // separately: this merge pass has NO UIDVALIDITY guard. `selectStaleHeaders`
+            // below classifies "the server did not return UID n" as stale, which on a
+            // re-created mailbox is true of EVERY local row (the new numbering restarts
+            // beneath them), and old-epoch headers also upsert cleanly into a folder whose
+            // numbering they no longer belong to. `v2final` closes this with its §5.5
+            // universal in-txn guard (`SyncEngineFullSync.swift:1045-1070` at tag
+            // `e28dd4edb`, ADR-IOS-061 Stage 1): re-read the folder row INSIDE this
+            // transaction and abandon the whole pass — before any deletion or upsert —
+            // when the epoch captured at fetch time disagrees with the stored one. That
+            // port is its own item; T1.2 must not widen the blast radius of a deleter it
+            // did not create, and must not narrow it either.
+            //
+            // T1.2b: bootstrap this folder's epoch from the SELECT that served the
+            // fetch above, as its own conditional statement inside this SAME
+            // transaction (`lastKnownUidValidity IS NULL` evaluated by SQLite at
+            // write time — see `SyncEngine.bootstrapFolderUidValidity`, whose doc
+            // comment enumerates all three writers of this column). On a
+            // non-UIDPLUS server this is the write that reaches a folder the
+            // deletion-reconcile walk has never visited — the walk's own bootstrap
+            // is the only other one that can, and it needs a count mismatch to run.
+            // It is BOOTSTRAP-ONLY and it is not part of the merge: it can only
+            // fill a nil column, never overwrite the epoch the local UIDs belong
+            // to, so it adds no deletion path — the walk's abort guard is armed by
+            // a populated column, never disarmed by one.
+            // T4.S6 — the §5.5 universal in-txn guard this pass had none of, and the
+            // reaction's primary trigger. Re-read the folder row INSIDE this
+            // transaction (the `folder` argument is a snapshot from BEFORE the
+            // network fetch, so it cannot decide anything) and refuse the pass on
+            // EITHER of two conditions: the folder is in UIDVALIDITY quarantine, or
+            // the stored epoch disagrees with the one the SELECT that served
+            // `messages` reported.
+            //
+            // REFERENCE (`v2final`, tag `7904961ded`):
+            // `SyncEngineFullSync.swift` ~1046-1072, the same in-txn `Folder`
+            // re-read feeding `uidValidityWriteAllowed(resetPending:observedEpoch:
+            // storedEpoch:)` = `!resetPending && !epochMismatch`. Written out here
+            // as two named branches instead of one shared pure formula because v3
+            // has exactly ONE guarded writer; the reference needed a shared formula
+            // because its backfill writers evaluate the same decision. The stored
+            // side differs deliberately: the reference reads its in-memory epoch
+            // ledger mirror, v3 reads `Folder.lastKnownUidValidity` from the row it
+            // has already fetched in this transaction — strictly fresher, and one
+            // fewer thing that can disagree with the durable value.
+            //
+            // On a proven disagreement the whole pass is ABANDONED before any
+            // deletion or upsert: `selectStaleHeaders` classifies "the server did
+            // not return UID n" as stale, which on a re-created mailbox is true of
+            // EVERY local row, and old-epoch headers would otherwise upsert cleanly
+            // into a numbering they no longer belong to. Fail-closed and TRANSIENT —
+            // the reaction fired below purges and resyncs this folder, and if it
+            // cannot run yet the next pass re-evaluates from scratch.
+            //
+            // BOTH-KNOWN is required. A nil observed epoch (the server reported no
+            // UIDVALIDITY on this SELECT) and a nil stored epoch (never bootstrapped)
+            // each fail OPEN, matching every other UIDVALIDITY guard in the tree —
+            // refusing on an unknown would brick non-UIDPLUS/first-sync folders.
+            let folderInTxn = try Folder.fetchOne(db, key: folderId)
+            // (a) QUARANTINE. Re-read IN this transaction — a check outside it is
+            // TOCTOU-broken by this codebase's own pending-ops-inside-txn rule.
+            //
+            // ⚑ This term is what makes the quarantine cover EVERY caller. The
+            // full-sync and delta-sync loops branch into the reaction before they
+            // reach here, but `syncFolderMessages` — the other door to this
+            // function — is also called by on-demand folder navigation
+            // (`AccountManagerFetch`), the detail view, the outbox drain and the
+            // op drain, none of which consult the flag. Without this the user
+            // merely OPENING a quarantined folder inserts NEW-epoch headers under
+            // the OLD stamp, which is exactly the state a bare-UID durable op
+            // mutates the wrong message from (C3).
+            //
+            // No self-lock: the reaction's own step-6 resync reaches this function
+            // AFTER step 5 has cleared the flag in the same write that stamped the
+            // fresh epoch, so the folder is out of quarantine by then. TRANSIENT —
+            // full sync re-drives an interrupted reaction on every cycle.
+            if folderInTxn?.uidValidityResetPendingAt != nil {
+                BackgroundSyncLogger.log("[Sync] merge pass SKIPPED for \(folderId) — folder is in UIDVALIDITY quarantine; the reaction owns it")
+                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [], upsertLine: nil)
+            }
+            // (b) EPOCH DISAGREEMENT.
+            let storedEpochInTxn = Self.knownUidValidity(
+                folderInTxn?.lastKnownUidValidity
+            ).flatMap { UInt32(exactly: $0) }
+            if let observed = observedEpochAtFetch, let stored = storedEpochInTxn, observed != stored {
+                // Ungated per CLAUDE.md rule 12 exception (b): production
+                // observability needs the turnover itself, not just its aftermath.
+                BackgroundSyncLogger.log("[Sync] UIDVALIDITY turnover at \(folderId): stored=\(stored) observed=\(observed) — abandoning this merge pass, triggering the purge-and-resync reaction")
+                AccountManager.shared.fireUidValidityChangeHandler(
+                    accountId: accountId, folderPath: folderPath,
+                    storedValue: stored, observedValue: observed
+                )
+                return (newHeaders: [], staleIds: [], replyDetectIds: [], uidMigratedOldIds: [], ftsRekeys: [], headerRekeys: [], upsertLine: nil)
+            }
+            try Self.bootstrapFolderUidValidity(
+                db, folderId: folderId, observed: observedEpochAtFetch.map { Int($0) })
+            // Load pending operation message IDs to avoid undoing optimistic UI.
+            // IMPORTANT: Filter by (accountId, folderPath) to prevent cross-folder UID collisions.
+            // IMAP UIDs are per-folder — UID "500" in INBOX and UID "500" in Archive are different
+            // messages. A global set would incorrectly block unrelated messages with the same UID.
+            //
+            // Upsert/flag filters scope to ops ORIGINATING FROM this folder (source match).
+            // Stale-delete protection also includes ops TARGETING this folder (destinationPath)
+            // — an optimistic move places the row at the destination with the source UID;
+            // that row must survive the sync pass at the destination until the drain executes.
+            let pendingOps = try PendingOperation.fetchAll(db)
+            let opsForThisFolder = pendingOps.filter { $0.accountId == accountId && $0.folderPath == folderPath }
+            let thisFolderSnapshot = PendingOperationSnapshot(ops: opsForThisFolder)
+            let pendingDestructiveIds = thisFolderSnapshot.destructive
+            let pendingFlagIds = thisFolderSnapshot.flag
+
+            let isPendingDestructive: (MessageHeaderInfo) -> Bool = { info in
+                pendingDestructiveIds.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
+            }
+            let isPendingFlag: (MessageHeaderInfo) -> Bool = { info in
+                pendingFlagIds.containsAnyKey(messageId: info.messageId, rfc822MessageId: info.rfc822MessageId)
+            }
+            // Recently completed guard — bridges gap between PendingOp deletion and
+            // server-side state propagation (30s TTL). Replaces per-folder recentActions.
+            //
+            // 🚨 READ INSIDE THIS TRANSACTION, never passed in from before the
+            // listing fetch above. Like the pending ops just loaded, the protection
+            // set must be as fresh as the write that consults it: a move completing
+            // during the fetch is retired (op deleted, row re-keyed to its
+            // destination) while `messages` still lists its source address, and a
+            // pre-fetch snapshot sees neither the op nor the entry — the
+            // snippet-less ghost re-insert of issue #106. The completion records
+            // its entry before its retirement transaction, and that transaction
+            // and this one are serialised on the same writer, so this read sees
+            // one of the two guards whichever side of the retirement it lands on.
+            // Entries are expiry-filtered at read, so no prune precedes this.
+            let recentlyCompleted = AccountManager.shared.liveRecentlyCompleted()
+            let isRecentlyCompleted: (MessageHeaderInfo) -> Bool = { info in
+                recentlyCompleted[info.messageId] != nil ||
+                (info.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false)
+            }
+            let opsTargetingThisFolder = pendingOps.filter {
+                $0.accountId == accountId && ($0.folderPath == folderPath || $0.destinationPath == folderPath)
+            }
+            let pendingAllIds = Set(opsTargetingThisFolder.flatMap(\.messageIds))
+            if !pendingDestructiveIds.isEmpty || pendingAllIds.count > pendingDestructiveIds.count {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] fullSync \(folder.name) — pendingDestructiveIds=\(pendingDestructiveIds) pendingAllIds=\(pendingAllIds)")
+                }
+            }
+            var newHeaders: [MessageHeader] = []
+            // Diagnostic-only id lists for the `[MoveTrace] fullSync upsert` line
+            // rendered at the end of this closure: `insertedIds` grows ONLY next
+            // to a `header.insert(db)`, `reclaimedIds` ONLY at the orphan-reclaim
+            // arm's in-place update. `newHeaders` carries BOTH kinds for the FTS /
+            // body-queue consumers and is deliberately not the source of either
+            // list — an in-place update reported as an insert is the lie R4-RS-1
+            // removed.
+            var insertedIds: [String] = []
+            var reclaimedIds: [String] = []
+            var staleIds: [String] = []
+            var ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)] = []
+            var headerRekeys: [HeaderRekeyRecord] = []
+            // Remove stale local messages.
+            // Uses date-bounded query to load only the overlap window, not all 8000+ messages.
+            // MessageAICache preserves AI state for re-inserted messages.
+            var replyDetectIds: [String] = []
+            let stale: [MessageHeader]
+            var allLocalIds: Set<String>?
+            // Stale-detection window dimension MUST match the provider's fetch ordering
+            // (see selectStaleHeaders): IMAP = UID (archive-time, decorrelated from date),
+            // Gmail/Exchange = date. A date window on IMAP over-deletes the Archive.
+            // DIAGNOSTIC (debug-gated): decompose the per-folder write so a residual long
+            // exec (e.g. All Mail) can be attributed to a PHASE, which the whole-tx
+            // `DBwrite EXEC` mark can't. `staleDetect` = the stale-candidate load (:611
+            // fetchAll OR :634 `CAST(messageId AS INTEGER)` scan — both scale with folder
+            // size; the CAST defeats the index so it scans ALL rows). `newRemoteIds` = the
+            // FIX-A bounded membership check. If newRemoteIds is ~ms while staleDetect is
+            // seconds, FIX A is working and the CAST-scan is the residual to bound next.
+            let staleCandT0 = CFAbsoluteTimeGetCurrent()
+            let windowMode = provider.staleWindowMode
+            // Complete-knowledge stale detection (treat the fetch as the whole folder and
+            // stale-delete any local row not returned) is only safe AND bounded when the
+            // LOCAL side is also small — so gate on a cheap index-backed COUNT (evaluated
+            // ONLY when the server proved whole-folder coverage, via `&&` short-circuit)
+            // and fall through to the bounded windowed slice when the folder is large.
+            // This bounds the load (no whole-folder fetchAll on All Mail).
+            //
+            // 🚨 The first term is `coverage.spansEntireFolder` — the SERVER's statement —
+            // and used to be `messages.count < limit`, a count taken AFTER the provider's
+            // `compactMap`. One unparseable record in a full window made that true for a
+            // 900-message folder, and this branch has no floor, so the other ~851 rows
+            // were deleted. `staleDetectionMaxFullScan` was never a defence against it
+            // (a 900-row folder is well under 2000). See `selectStaleHeaders`.
+            //
+            // `effectiveCoverage` is what `selectStaleHeaders` is told, and it is the
+            // decision ACTUALLY made here: a large folder falls to the windowed slice even
+            // when the server proved whole-folder coverage, so it must not then be handed
+            // a complete-knowledge claim over a bounded candidate set.
+            let effectiveCoverage: FetchCoverage
+            if coverage.spansEntireFolder,
+               try MessageHeader.filter(Column("folderId") == folderId).fetchCount(db) <= SyncConfig.staleDetectionMaxFullScan {
+                // Got everything AND the folder is small enough to trust — find local
+                // messages not in remote set
+                let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(db)
+                let localIds = Set(allLocal.map(\.messageId))
+                allLocalIds = localIds
+                if !allLocal.isEmpty && !remoteIds.isEmpty {
+                    if DebugModeManager.isLoggingEnabled() {
+                        let onlyLocal = localIds.subtracting(remoteIds)
+                        let onlyRemote = remoteIds.subtracting(localIds)
+                        if !onlyLocal.isEmpty || !onlyRemote.isEmpty {
+                            print("[Sync] \(folder.name) stale-check: local=\(allLocal.count) remote=\(messages.count) onlyLocal=\(Array(onlyLocal.prefix(5))) onlyRemote=\(Array(onlyRemote.prefix(5)))")
+                        }
+                    }
+                }
+                effectiveCoverage = coverage
+                stale = Self.selectStaleHeaders(
+                    candidates: allLocal, fetched: messages, coverage: effectiveCoverage, windowMode: windowMode)
+            } else {
+                // The server did not prove whole-folder coverage — OR it did but the folder
+                // holds more than `staleDetectionMaxFullScan` local rows, so a "complete"
+                // read is untrustworthy. Load ONLY the bounded candidate slice (not the
+                // whole folder, per the memory budget) in the fetch-ordering dimension,
+                // then let selectStaleHeaders re-apply the same floor as the single source
+                // of truth.
+                effectiveCoverage = FetchCoverage(
+                    serverRecordCount: coverage.serverRecordCount,
+                    spansEntireFolder: false,
+                    unmaterialisedIds: coverage.unmaterialisedIds)
+                let candidates: [MessageHeader]
+                switch windowMode {
+                case .uid:
+                    // messageId is a numeric IMAP UID; CAST avoids a lexicographic compare.
+                    if let floorUID = messages.compactMap({ Int64($0.messageId) }).min() {
+                        candidates = try MessageHeader.fetchAll(db, sql:
+                            "SELECT * FROM messageHeader WHERE folderId = ? AND CAST(messageId AS INTEGER) >= ?",
+                            arguments: [folderId, floorUID])
+                    } else {
+                        candidates = []  // no parseable UID floor → delete nothing (safe)
+                    }
+                case .date:
+                    // `providerDate`, not `date` — the page is ordered by the
+                    // provider's key; see `selectStaleHeaders` `.date` arm.
+                    if let fetchCutoff = messages.map(\.providerOrderDate).min() {
+                        candidates = try MessageHeader
+                            .filter(Column("folderId") == folderId && Column("providerDate") >= fetchCutoff)
+                            .fetchAll(db)
+                    } else {
+                        candidates = []
+                    }
+                }
+                stale = Self.selectStaleHeaders(
+                    candidates: candidates, fetched: messages, coverage: effectiveCoverage, windowMode: windowMode)
+            }
+            BootProfiler.mark("sync[\(folder.name)] staleDetect \(Int((CFAbsoluteTimeGetCurrent() - staleCandT0) * 1000))ms (stale=\(stale.count), remote=\(messages.count))")
+            // Don't delete messages with pending operations or recently completed ops.
+            // Undo-restored messages are protected by their PendingOp(move-back).
+            let isProtectedByPending: (MessageHeader) -> Bool = { msg in
+                pendingAllIds.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId)
+            }
+            let isProtectedByRecent: (MessageHeader) -> Bool = { msg in
+                recentlyCompleted[msg.messageId] != nil ||
+                (msg.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false)
+            }
+            // Protect optimistic Sent headers: outbox messages with sentMessageId set are
+            // in-flight (sent but IMAP APPEND may not have completed). Their rfc822MessageId
+            // matches the optimistic header — don't delete until the real message appears.
+            var outboxProtectedRfc822s = Set<String>()
+            if folder.role == .sent {
+                let outboxRfc822s = try String.fetchAll(db, sql: """
+                    SELECT sentMessageId FROM outboxMessage
+                    WHERE accountId = ? AND sentMessageId IS NOT NULL
+                """, arguments: [accountId])
+                for raw in outboxRfc822s {
+                    outboxProtectedRfc822s.insert(EmailFilter.normalizeMessageId(raw))
+                }
+            }
+            let protectedIds = pendingAllIds
+            if DebugModeManager.isLoggingEnabled() {
+                let pendingSkipped = stale.filter { isProtectedByPending($0) || isProtectedByRecent($0) }
+                if !pendingSkipped.isEmpty {
+                    print("[MoveTrace] fullSync \(folder.name) — skipping stale delete for \(pendingSkipped.count) msgs with pending/recent ops: \(pendingSkipped.map(\.messageId))")
+                }
+            }
+            // CONFIRMING INSTRUMENT (stale-race fix): a stale candidate saved ONLY by the
+            // recent-arrival/completed guard (not a pending op) is a message the server
+            // fetch transiently missed. A hit here right after a `merge: stale-protected …`
+            // mark IS the pre-verify drop race — now caught instead of dropped. Debug-gated.
+            let recentSaved = stale.filter { !isProtectedByPending($0) && isProtectedByRecent($0) }.count
+            if recentSaved > 0 {
+                BootProfiler.mark("fullSync \(folder.name): stale-delete SKIPPED for \(recentSaved) recently-arrived/completed msg(s) — pre-verify drop prevented")
+            }
+
+            // UID remap detection: before deleting stale messages, check if any have
+            // rfc822MessageId matching a NEW remote message in the same folder. This catches
+            // UID changes from IMAP MOVE round-trips, server-side operations, UIDVALIDITY
+            // changes, etc. Migrate the local row in-place to preserve local state (body, AI cache).
+            var uidMigratedRemoteIds = Set<String>()
+            var uidMigratedOldMsgIds: [String] = []
+            // Which remote ids are NEW (not already local) — bounded membership check;
+            // see `newRemoteIds(in:folderId:remoteIds:cachedLocalIds:)`. Reuses the
+            // allLocalIds set from stale detection when it was already loaded.
+            let remapT0 = CFAbsoluteTimeGetCurrent()
+            let newRemoteIds = try Self.newRemoteIds(
+                in: db, folderId: folderId, remoteIds: remoteIds, cachedLocalIds: allLocalIds
+            )
+            BootProfiler.mark("sync[\(folder.name)] newRemoteIds \(Int((CFAbsoluteTimeGetCurrent() - remapT0) * 1000))ms")
+            // Pre-build lookup by rfc822MessageId for O(1) matching (avoids O(stale × messages) scan)
+            var newMessagesByRfc822: [String: [MessageHeaderInfo]] = [:]
+            for msg in messages where newRemoteIds.contains(msg.messageId) {
+                if let rfc822 = msg.rfc822MessageId, !rfc822.isEmpty {
+                    newMessagesByRfc822[rfc822, default: []].append(msg)
+                }
+            }
+            for staleMsg in stale {
+                guard let rfc822 = staleMsg.rfc822MessageId, !rfc822.isEmpty else { continue }
+                guard let match = newMessagesByRfc822[rfc822]?.first(where: {
+                    !uidMigratedRemoteIds.contains($0.messageId)
+                }) else { continue }
+                let oldId = staleMsg.id
+                let newMsgId = match.messageId
+                let newId = "\(accountId):\(folderPath):\(newMsgId)"
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] UID remap: rfc822=\(rfc822) \(staleMsg.messageId)→\(newMsgId) in \(folder.name)")
+                }
+                var migrated = staleMsg
+                migrated.id = newId
+                migrated.messageId = newMsgId
+                // RFC-only UID remap is corroboration, not provider-address
+                // ownership. T5.11 may prove a later canonical adoption.
+                migrated.observedUidValidity = nil
+                // If the remote match has a broken (epoch 0) date from IMAP parse
+                // failure, the entire remote record can't be trusted — preserve all
+                // local fields (isRead, isFlagged, date). The UID remap still happens
+                // so future syncs find the message, but we don't copy the broken
+                // remote state. Next sync cycle will update with valid data.
+                if match.date.timeIntervalSince1970 >= 86400 {
+                    migrated.isRead = match.isRead
+                    migrated.isFlagged = match.isFlagged
+                    migrated.date = match.date
+                    migrated.providerDate = match.providerOrderDate
+                }
+                // SHARED WITH THE DRAIN. `MessageHeaderRekey.apply` is this
+                // block's own sequence, extracted verbatim so the drain can run
+                // the IDENTICAL re-key earlier on the server's `COPYUID`
+                // (`MessageHeaderRekey.finishMove`) instead of leaving every
+                // moved row to be repaired here on weaker RFC 822 evidence. It
+                // owns the body carry-forward, the two explicit deletes that
+                // must precede every exit, the already-present collision skip,
+                // and the two FK-cascading child tables (`messageReference`
+                // rebuilt, `messageUserLabel` carried) this block used to
+                // destroy silently.
+                guard try MessageHeaderRekey.apply(from: staleMsg, to: migrated, db: db) else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] UID remap: SKIPPING migrate-insert for \(newId) — already present")
+                    }
+                    continue
+                }
+                // Move the FTS entry to the new id IN PLACE (preserves the
+                // indexed body text + the messages_vec embedding). Previously
+                // the old FTS row ghosted forever (search hits deep-linking to
+                // a deleted header id) and the new id was invisible to search.
+                ftsRekeys.append((oldId: oldId, newId: newId, newMessageId: newMsgId))
+                // Only UID-scoped providers publish this weak mapping into an
+                // active view. Date-window providers (notably Graph) use opaque
+                // actionable ids, so RFC correlation must not immediately turn
+                // an arbitrary duplicate Message-ID match into UI action state.
+                // Their durable/FTS repair remains unchanged and a normal reload
+                // converges from GRDB.
+                if windowMode == .uid {
+                    headerRekeys.append(HeaderRekeyRecord(
+                        oldHeaderId: oldId,
+                        newHeaderId: newId,
+                        newProviderMessageId: newMsgId,
+                        carriesProviderAuthority: false))
+                }
+                uidMigratedRemoteIds.insert(newMsgId)
+                uidMigratedOldMsgIds.append(staleMsg.messageId)
+            }
+
+            let uidMigratedSet = Set(uidMigratedOldMsgIds)
+            let isProtected: (MessageHeader) -> Bool = { msg in
+                protectedIds.containsAnyKey(messageId: msg.messageId, rfc822MessageId: msg.rfc822MessageId) ||
+                recentlyCompleted[msg.messageId] != nil ||
+                (msg.rfc822MessageId.map { recentlyCompleted[$0] != nil } ?? false) ||
+                (msg.rfc822MessageId.map { outboxProtectedRfc822s.contains($0) } ?? false)
+            }
+            let staleFiltered = stale.filter { !isProtected($0) && !uidMigratedSet.contains($0.messageId) }
+            // Append, never assign — re-keyed old ids ride ftsRekeys (the FTS
+            // entry MOVES, it must not be removed), but staleIds may already
+            // carry entries from earlier loop passes and the canonicalizer in
+            // the upsert loop appends merge-loser ids later. An assignment
+            // here would clobber the accumulation contract.
+            staleIds.append(contentsOf: staleFiltered.map(\.id))
+            for msg in staleFiltered {
+                if folder.role == .drafts || folder.role == .sent {
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] DraftStaleDelete: removing \(msg.id) msgId=\(msg.messageId) rfc822=\(msg.rfc822MessageId ?? "nil") snippet=\(String(msg.snippet.prefix(60)))")
+                    }
+                }
+                try msg.delete(db)
+            }
+            if !staleFiltered.isEmpty {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] \(folder.name): removed \(staleFiltered.count) stale messages")
+                }
+            }
+
+            // Insert new / update existing.
+            // Skip messages with pending destructive ops or recently completed ops —
+            // prevents re-inserting optimistically removed messages or overwriting flags
+            // during the gap between PendingOp deletion and server propagation.
+            let skippedByPending = messages.filter { isPendingDestructive($0) }
+            let skippedByRecent = messages.filter { isRecentlyCompleted($0) && !isPendingDestructive($0) }
+            let skippedByPendingIds = Set(skippedByPending.map(\.messageId))
+            let skippedByRecentIds = Set(skippedByRecent.map(\.messageId))
+            // IOS-IMAP-001 / D3 — the other half of "not present for display".
+            // Subtracting the id from `remoteIds` above lets the stale channel
+            // REMOVE a row that already exists (inheriting its pending/recent/outbox
+            // protections and its FTS cleanup); this stops the upsert loop
+            // RE-CREATING it in the same transaction, and stops a first sighting
+            // ever materialising one. No server-side operation is issued for either.
+            let allSkippedIds = skippedByPendingIds
+                .union(skippedByRecentIds)
+                .union(deletedRemoteIds)
+            if !deletedRemoteIds.isEmpty {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] \(folder.name): \(deletedRemoteIds.count) remote message(s) carry \\Deleted — not presented (IOS-IMAP-001)")
+                }
+            }
+            if !skippedByPendingIds.isEmpty {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByPendingIds.count) msgs with pending destructive ops: \(skippedByPendingIds)")
+                }
+            }
+            if !skippedByRecentIds.isEmpty {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByRecentIds.count) msgs recently completed: \(skippedByRecentIds)")
+                }
+            }
+            // DIAGNOSTIC (emitted as a debug-gated mark before this closure returns):
+            // per-folder upsert churn. `noop` = existing rows whose server data did NOT
+            // actually change — the redundant UPDATEs that churned the WAL on every full
+            // sync before the change-detection (updateChanges) below was added.
+            var upsUpdated = 0, upsNoop = 0, upsDraftSentSkip = 0
+            // DIAGNOSTIC: pinpoint the residual multi-second per-folder write (boot_logs
+            // 6: Sent Messages 50 msg / 3.3s, cpu-bound). `loop` = total upsert-loop wall
+            // time; `recon` = time in the per-message existence lookup
+            // (canonicalizeLocalRows / drafts-sent fetchOne). If loop≈writeMs the loop is
+            // the cost; if recon≈loop the lookup is (planner not using the index on-device
+            // despite DatabaseIndexTests); else the cost is the mutation side (updateChanges
+            // / FTS / AI cache) or pre-loop stale processing (loop ≪ writeMs).
+            var upsReconSeconds = 0.0
+            let upsLoopT0 = CFAbsoluteTimeGetCurrent()
+            for info in messages where !allSkippedIds.contains(info.messageId) && !uidMigratedRemoteIds.contains(info.messageId) {
+                // Canonicalize PKs + merge duplicate rows (optimistic-move
+                // remnants keep their old "accountId:<oldPath>:<msgId>" PK
+                // forever for stable-id providers — see canonicalizeLocalRows).
+                // Drafts/Sent are exempt: DraftStore's push migration manages
+                // their row identity.
+                let reconT0 = CFAbsoluteTimeGetCurrent()
+                // RFC identity remains metadata/corroboration only. Provider-
+                // address ownership is decided from the bound fetch provenance.
+                let normalizedIncomingRfc822 = Self.normalizedRfc822Identity(info.rfc822MessageId)
+                let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool)
+                if folder.role == .drafts || folder.role == .sent {
+                    let row = try MessageHeader
+                        .filter(Column("messageId") == info.messageId && Column("folderId") == folderId)
+                        .fetchOne(db)
+                    let canonicalId = MessageIdentity.headerId(
+                        accountId: accountId, folderPath: folderPath, messageId: info.messageId)
+                    let sourceAddressProven = row.map {
+                        Self.providerAddressOwnershipProven(
+                            row: $0, accountId: accountId, folderPath: folderPath,
+                            folderId: folderId, messageId: info.messageId,
+                            canonicalId: canonicalId, windowMode: windowMode,
+                            sourceBoundEpoch: sourceBoundEpoch)
+                    } ?? false
+                    recon = (row, [], nil, sourceAddressProven)
+                } else {
+                    recon = try Self.canonicalizeLocalRows(
+                        accountId: accountId, folderPath: folderPath,
+                        folderId: folderId, messageId: info.messageId,
+                        isInInbox: isInInbox,
+                        windowMode: windowMode,
+                        sourceBoundEpoch: sourceBoundEpoch,
+                        incomingRfc822Identity: normalizedIncomingRfc822, db: db
+                    )
+                }
+                upsReconSeconds += CFAbsoluteTimeGetCurrent() - reconT0
+                if !recon.removedIds.isEmpty {
+                    staleIds.append(contentsOf: recon.removedIds)
+                }
+                if let rekey = recon.ftsRekey {
+                    // FTS entry moves to the new id in place — body text and
+                    // embedding ride along. messageId is unchanged here.
+                    ftsRekeys.append((oldId: rekey.oldId, newId: rekey.newId, newMessageId: nil))
+                }
+                if var existing = recon.row {
+                    // Pre-mutation snapshot so the write below can be SKIPPED when the
+                    // server data changed nothing (change-detection — see updateChanges).
+                    let original = existing
+                    // Drafts/Sent special case: the server's drafts.list / equivalent
+                    // summary metadata (date, snippet, to, rfc822) lags behind the
+                    // actual message resource right after a local push. We already
+                    // merged our fresh local content into this row via
+                    // DraftStore.pushDraftToServer's migration step — let that
+                    // be the source of truth. Overwriting here snaps date/from/to
+                    // back to the server's stale view ("time snaps back" bug).
+                    // Inserts and deletions for drafts still flow through sync
+                    // normally via the dedup + stale-check paths above; this guard
+                    // only prevents destructive metadata refresh on existing rows.
+                    if folder.role == .drafts || folder.role == .sent {
+                        // Preserve local drafts/sent content — the server's drafts.list /
+                        // summary metadata lags behind the real message right after a local
+                        // push. Counted in `upsDraftSentSkip`, reported in the aggregate
+                        // `fullSync upsert[...]` mark below.
+                        //
+                        // NO per-message log here: it fired ~50×/full-sync INSIDE the write
+                        // transaction. Even debug-gated, when logging was ON each print cost
+                        // ~80ms of (stdout→file) I/O — measured loop=4130ms vs recon=11ms for
+                        // a 50-skip Sent sync (boot/logmain 2026-07-06), i.e. ~4s of the
+                        // single GRDB writer held per Sent sync, plus hundreds of piled log
+                        // lines. The aggregate count is the diagnostic; the per-id detail
+                        // isn't worth holding the writer.
+                        existing.observedUidValidity = recon.sourceAddressProven ? sourceBoundEpoch : nil
+                        if try existing.updateChanges(db, from: original) {
+                            upsUpdated += 1
+                        }
+                        upsDraftSentSkip += 1
+                        continue
+                    }
+                    // The v2final fail-closed branch is retained, but its RFC
+                    // discriminator is SUBTRACTED. Only the provider-native
+                    // proof computed before canonicalization can authorize any
+                    // incoming field merge.
+                    guard recon.sourceAddressProven else {
+                        existing.observedUidValidity = nil
+                        _ = try existing.updateChanges(db, from: original)
+                        BackgroundSyncLogger.log("[Sync] merge REFUSED for \(existing.id) (folder=\(folderPath)) — provider-address ownership is unproven; message fields stay untouched and the source observation stamp is cleared")
+                        upsNoop += 1
+                        continue
+                    }
+                    existing.observedUidValidity = sourceBoundEpoch
+
+                    // Update existing message with latest data from server.
+                    // Skip flag/tag overwrites if message has pending queue ops OR
+                    // recently completed ops (server may lag behind the executed change).
+                    let hasPendingFlags = isPendingFlag(info) || isRecentlyCompleted(info)
+                    if !hasPendingFlags {
+                        existing.isRead = info.isRead
+                        existing.isFlagged = info.isFlagged
+                        if isInInbox, let serverTag = info.actionTag {
+                            if existing.actionTag != serverTag {
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[Sync] Remote tag change detected for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                                }
+                                try MessageAICache.writeThrough(
+                                    accountId: accountId,
+                                    folderPath: folderPath,
+                                    rfc822MessageId: existing.rfc822MessageId,
+                                    actionTag: serverTag,
+                                    db: db
+                                )
+                            }
+                            existing.actionTag = serverTag
+                            existing.tagSortOrder = serverTag.sortOrder
+                        }
+                    }
+                    existing.date = info.date
+                    existing.providerDate = info.providerOrderDate
+                    existing.from = info.from
+                    existing.fromAddress = info.fromAddress
+                    existing.to = info.to
+                    existing.cc = info.cc
+                    existing.bcc = info.bcc
+                    existing.replyTo = info.replyTo
+                    // Preserve locally-set replied/forwarded state — providers may not
+                    // support these flags (Gmail REST API always returns false).
+                    // Only upgrade from false→true, never downgrade.
+                    existing.isReplied = existing.isReplied || info.isReplied
+                    existing.isForwarded = existing.isForwarded || info.isForwarded
+                    // RFC Message-ID is metadata/corroboration, not address
+                    // authority. A nil incoming value carries no metadata signal
+                    // and must never NULL a stored value.
+                    if normalizedIncomingRfc822 != nil {
+                        existing.rfc822MessageId = info.rfc822MessageId
+                        existing.referencesJSON = MessageHeader.encodeReferences(info.references)
+                    }
+                    // ReplyDetect: if message is replied (server or local) and has reply tag, override to none
+                    // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
+                    if existing.isReplied && existing.actionTag == .reply {
+                        existing.actionTag = ActionTag.none
+                        existing.tagSortOrder = ActionTag.none.sortOrder
+                        var tagOp = PendingOperation(
+                            type: .setTag,
+                            messageIds: [existing.stableId],
+                            accountId: accountId,
+                            folderPath: folderPath,
+                            tagValue: ActionTag.none.rawValue
+                        )
+                        try tagOp.insert(db)
+                        replyDetectIds.append(existing.id)
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[ReplyDetect] Sync update: reply→none for \(info.messageId) (already replied)")
+                        }
+                    }
+                    // Change-detection: write ONLY when the server actually changed a
+                    // column. The old unconditional `existing.update(db)` rewrote every
+                    // existing row on every full sync (e.g. Archive: 50 rows × N syncs of
+                    // no-op writes) — pure WAL churn. `updateChanges(from:)` is
+                    // end-state-identical but skips the write (and returns false) when
+                    // nothing differs.
+                    if try existing.updateChanges(db, from: original) {
+                        upsUpdated += 1
+                    } else {
+                        upsNoop += 1
+                    }
+                    continue
+                }
+
+                var header = MessageHeader(
+                    messageId: info.messageId,
+                    subject: info.subject,
+                    from: info.from,
+                    fromAddress: info.fromAddress,
+                    to: info.to,
+                    date: info.date,
+                    snippet: EmailFilter.cleanSnippet(info.snippet),
+                    folderId: folderId,
+                    accountId: accountId,
+                    folderPath: folderPath,
+                    isInInbox: isInInbox,
+                    providerDate: info.providerOrderDate
+                )
+                header.rfc822MessageId = info.rfc822MessageId
+                header.observedUidValidity = sourceBoundEpoch
+                header.inReplyTo = info.inReplyTo
+                header.referencesJSON = MessageHeader.encodeReferences(info.references)
+                header.threadId = info.threadId ?? ThreadUtils.computeSubjectThreadId(accountId: accountId, subject: header.subject)
+                try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: info.threadId, db: db)
+                header.replyTo = info.replyTo
+                header.cc = info.cc
+                header.bcc = info.bcc
+                header.isRead = info.isRead
+                header.isFlagged = info.isFlagged
+                header.hasAttachments = info.hasAttachments
+                header.isReplied = info.isReplied
+                header.isForwarded = info.isForwarded
+                // Action tags are inbox-scoped — only apply server tags for inbox messages.
+                if isInInbox {
+                    header.actionTag = info.actionTag
+                    header.tagSortOrder = info.actionTag?.sortOrder ?? 99
+                }
+                try MessageAICache.restoreIfCached(
+                    into: &header,
+                    accountId: accountId,
+                    folderPath: folderPath,
+                    db: db
+                )
+                // ReplyDetect: if message is already replied and tagged as "reply", override to "none"
+                // AI cache keeps original LLM value — only MessageHeader + IMAP tag change
+                if header.isReplied && header.actionTag == .reply {
+                    header.actionTag = ActionTag.none
+                    header.tagSortOrder = ActionTag.none.sortOrder
+                    var tagOp = PendingOperation(
+                        type: .setTag,
+                        messageIds: [header.stableId],
+                        accountId: accountId,
+                        folderPath: folderPath,
+                        tagValue: ActionTag.none.rawValue
+                    )
+                    try tagOp.insert(db)
+                    replyDetectIds.append(header.id)
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ReplyDetect] Sync insert: reply→none for \(header.messageId) (already replied)")
+                    }
+                }
+                // Dedup by rfc822MessageId in Drafts/Sent folders: optimistic creation
+                // inserts a placeholder MessageHeader before the IMAP UID is known. When
+                // sync returns the real UID, match by rfc822MessageId and update in place
+                // to prevent duplicate rows.
+                if (folder.role == .drafts || folder.role == .sent),
+                   let rfc822 = header.rfc822MessageId, !rfc822.isEmpty,
+                   let optimistic = try MessageHeader.fetchOne(
+                    db, sql: Self.optimisticDedupSQL,
+                    arguments: [folderId, rfc822, header.messageId]) {
+                    let oldId = optimistic.id
+                    // RFC-only placeholder adoption is not native ownership.
+                    header.observedUidValidity = nil
+                    // Capture body for migration — defer insert until after header (FK constraint)
+                    var deferredBody: MessageBody?
+                    if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
+                        var newBody = body
+                        newBody.id = ContentKey(rawValue: header.id)
+                        try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
+                        deferredBody = newBody
+                    }
+                    // MessageAICache uses composite key, not headerId — unlikely for drafts
+                    // but clean up if present. Shared-helper keys so any drift between
+                    // writers (NSE, sync, device-sync peer) surfaces at compile time.
+                    let cacheKey = MessageIdentity.aiCacheKey(
+                        accountId: accountId, folderPath: folderPath,
+                        rfc822MessageId: optimistic.rfc822MessageId
+                    )
+                    let newCacheKey = MessageIdentity.aiCacheKey(
+                        accountId: accountId, folderPath: folderPath,
+                        rfc822MessageId: header.rfc822MessageId
+                    )
+                    if let cacheKey, let newCacheKey, cacheKey != newCacheKey,
+                       try MessageAICache.fetchOne(db, key: cacheKey) != nil {
+                        try db.execute(sql: "UPDATE messageAICache SET key = ? WHERE key = ?", arguments: [newCacheKey, cacheKey])
+                    }
+                    try optimistic.delete(db)
+                    guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
+                        if folder.role == .drafts || folder.role == .sent {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] DraftDedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot). remoteSnippet=\(String(header.snippet.prefix(60)))")
+                            }
+                        } else {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] Dedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
+                            }
+                        }
+                        // R16-8 — THE REMOVAL CHANNEL, because this leg discards
+                        // rather than migrates. `optimistic` is already deleted and
+                        // `deferredBody` is never inserted, so `oldId` names content
+                        // that no longer exists; without this it rode NEITHER
+                        // `ftsRekeys` nor `staleIds` and left a permanent FTS orphan.
+                        staleIds.append(oldId)
+                        continue
+                    }
+                    try header.insert(db)
+                    if let body = deferredBody { try body.insert(db) }
+                    // R16-8 — THE RE-KEY CHANNEL. The body (and with it the indexed
+                    // text and its embedding) was CARRIED to `header.id`, so the FTS
+                    // entry must MOVE, not be removed. This block ends in `continue`,
+                    // which bypasses every shared disposition below, so the old id
+                    // has to be routed here explicitly — the UID-remap carrier in
+                    // this same function already does exactly this, which is what
+                    // made these two blocks unswept MEMBERS rather than a whole-path
+                    // omission. ⚠️ Not a "the next sync repairs it" case: the
+                    // compensating sweep `pruneFTSOrphans` has ONE production caller,
+                    // `oneTimeFTSReconciliation`, gated on a `UserDefaults` flag it
+                    // sets on first success with no production reset — so it
+                    // provably cannot run again (`MIS-024`).
+                    ftsRekeys.append((oldId: oldId, newId: header.id, newMessageId: header.messageId))
+                    try ThreadUtils.insertMessageReferences(for: header, db: db)
+                    // Insert user label associations
+                    for labelId in info.userLabelIds {
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
+                            .insert(db, onConflict: .ignore)
+                    }
+                    newHeaders.append(header)
+                    insertedIds.append(header.id)
+                    if folder.role == .drafts || folder.role == .sent {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] DraftDedup: replaced optimistic \(folder.role.rawValue) header \(oldId) → \(header.id) | oldSnippet=\(String(optimistic.snippet.prefix(60))) | newSnippet=\(String(header.snippet.prefix(60)))")
+                        }
+                    } else {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] Dedup: replaced optimistic \(folder.role == .drafts ? "draft" : "sent") header \(oldId) with \(header.id)")
+                        }
+                    }
+                    continue
+                }
+
+                // Pre-sync reclaim: if NSE (or any other writer) inserted this
+                // message's inbox row with a different folderPath/folderId than
+                // what sync is about to use, we want to keep the AI work and
+                // migrate it — not create a duplicate row. Find any existing
+                // inbox row for this (accountId, messageId) and migrate it to
+                // the new identity before falling through to the insert. Scope
+                // to `isInInbox=true` so Gmail's label system (same messageId
+                // under multiple folder-labels) still produces one row per
+                // folder — only the inbox row is reclaimed here.
+                //
+                // This is the safety net for bug 2c: even if upstream capture
+                // of folderPath drifts in the future, sync converges on one
+                // row per message.
+                if isInInbox {
+                    // fetchAll not fetchOne: if a bug elsewhere produced two
+                    // inbox rows for the same (accountId, messageId), we want
+                    // to clean up BOTH — using fetchOne would migrate one and
+                    // leave the other orphaned, compounding the drift.
+                    let preSyncRowsAll = try MessageHeader
+                        .filter(Column("accountId") == accountId)
+                        .filter(Column("messageId") == info.messageId)
+                        .filter(Column("isInInbox") == true)
+                        .filter(Column("id") != header.id)
+                        .fetchAll(db)
+                    // R15-F1 identity gate — sibling of the one in
+                    // `canonicalizeLocalRows` (see its parameter doc). This
+                    // reclaim exists for folderPath-drift duplicates of the SAME
+                    // message (NSE writer drift); its bare
+                    // (accountId, messageId, isInInbox) match also catches a
+                    // DIFFERENT message optimistically moved INTO the inbox whose
+                    // source-folder UID coincides — the first such row is DELETED
+                    // below (`try preSync.delete(db)`) and any tail rows are
+                    // deleted outright, so an ungated match drops the user's moved
+                    // message and grafts its AI state onto the incoming one.
+                    // Exclude rows whose stored identity provably differs; with a
+                    // nil incoming identity and conflicting stored identities,
+                    // refuse the whole reclaim (no discriminating signal — the next
+                    // identity-carrying pass discriminates). An empty result is not
+                    // a dead end: control falls through to the orphan/insert path,
+                    // which stores the incoming message normally.
+                    let preSyncRows: [MessageHeader]
+                    if let incoming = normalizedIncomingRfc822 {
+                        preSyncRows = preSyncRowsAll.filter { row in
+                            let stored = Self.normalizedRfc822Identity(row.rfc822MessageId)
+                            return stored == nil || stored == incoming
+                        }
+                        if preSyncRows.count != preSyncRowsAll.count {
+                            // Ungated per CLAUDE.md rule 12 exception (b).
+                            BackgroundSyncLogger.log("[Sync] ERROR: pre-sync inbox reclaim identity gate at (accountId=\(accountId), msgId=\(info.messageId)) excluded \(preSyncRowsAll.count - preSyncRows.count) row(s) whose stored rfc822MessageId differs from the incoming identity (R15-F1)")
+                        }
+                    } else {
+                        let distinctNonNil = Set(preSyncRowsAll.compactMap { Self.normalizedRfc822Identity($0.rfc822MessageId) })
+                        if distinctNonNil.count > 1 {
+                            BackgroundSyncLogger.log("[Sync] ERROR: pre-sync inbox reclaim at (accountId=\(accountId), msgId=\(info.messageId)) found \(distinctNonNil.count) distinct stored identities with a NIL incoming identity — refusing the reclaim (R15-F1)")
+                            preSyncRows = []
+                        } else {
+                            preSyncRows = preSyncRowsAll
+                        }
+                    }
+                    if preSyncRows.count > 1 {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] Pre-sync reclaim: \(preSyncRows.count) matching inbox rows for \(info.messageId) — merging all")
+                        }
+                    }
+                    if let preSync = preSyncRows.first {
+                    let oldId = preSync.id
+                    // Account/message reclaim is not a folder-native PK proof.
+                    header.observedUidValidity = nil
+                    // Preserve locally-computed AI work — sync has no actionTag
+                    // / summaryBlurb / reminder fields for Outlook (Graph does
+                    // not store them) and for Gmail they arrive via provider
+                    // labels only, so unconditionally preferring preSync's
+                    // fields when header's are nil keeps NSE's output.
+                    if header.actionTag == nil, let tag = preSync.actionTag {
+                        header.actionTag = tag
+                        header.tagSortOrder = tag.sortOrder
+                    }
+                    if header.summaryBlurb == nil {
+                        header.summaryBlurb = preSync.summaryBlurb
+                        header.summaryTodos = preSync.summaryTodos
+                        header.reminderDate = preSync.reminderDate
+                        header.reminderTime = preSync.reminderTime
+                        header.reminderContent = preSync.reminderContent
+                    }
+                    if header.cachedReply == nil { header.cachedReply = preSync.cachedReply }
+                    header.notified = header.notified || preSync.notified
+                    // Migrate MessageBody (FK to old id) before delete.
+                    var deferredBody: MessageBody?
+                    if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
+                        var newBody = body
+                        newBody.id = ContentKey(rawValue: header.id)
+                        try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
+                        deferredBody = newBody
+                    }
+                    // Migrate AI cache key (folderPath changed → key changed).
+                    let oldCacheKey = MessageIdentity.aiCacheKey(
+                        accountId: accountId, folderPath: preSync.folderPath,
+                        rfc822MessageId: preSync.rfc822MessageId
+                    )
+                    let newCacheKey = MessageIdentity.aiCacheKey(
+                        accountId: accountId, folderPath: folderPath,
+                        rfc822MessageId: header.rfc822MessageId
+                    )
+                    if let oldCacheKey, let newCacheKey, oldCacheKey != newCacheKey,
+                       try MessageAICache.fetchOne(db, key: oldCacheKey) != nil {
+                        try db.execute(
+                            sql: "UPDATE messageAICache SET key = ? WHERE key = ?",
+                            arguments: [newCacheKey, oldCacheKey]
+                        )
+                    }
+                    // Keep the reclaimed row's durable identity when the incoming
+                    // envelope carries none. `header.rfc822MessageId` came from
+                    // `info.rfc822MessageId`, which is nil whenever the envelope has
+                    // no Message-ID — so without this the reclaim NULLs an identity
+                    // the local row already held, flipping `MessageHeader.stableId`
+                    // to the bare UID and re-admitting bare-UID gestures against a
+                    // message that had a durable id a moment earlier. This is the
+                    // same assign/keep rule already applied at the `existing` merge
+                    // branch and at the orphan reclaim.
+                    if normalizedIncomingRfc822 == nil { header.rfc822MessageId = preSync.rfc822MessageId }
+                    try preSync.delete(db)
+                    try header.insert(db)
+                    if let body = deferredBody { try body.insert(db) }
+                    // R16-8 — THE RE-KEY CHANNEL, same reason as the DraftDedup block
+                    // above: the body is carried to `header.id`, this block ends in
+                    // `continue`, and `pruneFTSOrphans` provably cannot run a second
+                    // time. Without this the reclaimed row's indexed text stays filed
+                    // under a header id that no longer exists.
+                    ftsRekeys.append((oldId: oldId, newId: header.id, newMessageId: header.messageId))
+                    try ThreadUtils.insertMessageReferences(for: header, db: db)
+                    for labelId in info.userLabelIds {
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
+                            .insert(db, onConflict: .ignore)
+                    }
+                    newHeaders.append(header)
+                    // A NEW row under `header.id` (the pre-sync row was deleted
+                    // above and re-inserted here), so it is an insert for the
+                    // diagnostic even though the log line below says "reclaimed".
+                    insertedIds.append(header.id)
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] Reclaimed pre-sync inbox row \(oldId) → \(header.id) (folderPath drift, preserved AI)")
+                    }
+                    // Clean up any additional duplicates — their AI fields
+                    // already merged via the fetchAll scan isn't worth doing
+                    // (the first row won the preservation race; the tail are
+                    // stale dupes). Just delete to prevent orphaned cache
+                    // rows / body rows sticking around after reclaim.
+                    for extra in preSyncRows.dropFirst() {
+                        let extraId = extra.id
+                        if let oldCacheKey = MessageIdentity.aiCacheKey(
+                            accountId: accountId, folderPath: extra.folderPath,
+                            rfc822MessageId: extra.rfc822MessageId
+                        ) {
+                            try db.execute(
+                                sql: "DELETE FROM messageAICache WHERE key = ?",
+                                arguments: [oldCacheKey]
+                            )
+                        }
+                        try MessageBody.deleteOne(db, key: extraId)
+                        try extra.delete(db)
+                        // R16-8 — THE REMOVAL CHANNEL. These tail duplicates are
+                        // DELETED, not migrated, so their FTS entries must go with
+                        // them. Third member of the same class as the two re-key
+                        // legs: enumerated by *"a header row this block destroys or
+                        // re-keys"*, not by *"a block that re-keys"*.
+                        staleIds.append(extraId)
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] Pre-sync reclaim: removed duplicate inbox row \(extraId)")
+                        }
+                    }
+                    continue
+                    }  // closes `if let preSync`
+                }  // closes `if isInInbox`
+
+                // Check for orphaned row: same id (accountId:folderPath:messageId) but
+                // different folderId — left behind by a no-op optimistic move (e.g., archive
+                // from All Mail on Gmail). Reclaim by updating in place to preserve
+                // MessageBody and MessageAICache FK references.
+                if var orphaned = try MessageHeader.fetchOne(db, key: header.id) {
+                    // Respect pending user intention — if this row is queued for
+                    // a destructive op, the optimistic folderPath is authoritative.
+                    // Without this guard, a delta/full sync that sees the message
+                    // still in the source folder (server lag) would silently undo
+                    // the user's move. Uses the two-key check because pending ops
+                    // key by stableId (rfc822 for IMAP, messageId for Gmail/Exchange).
+                    let orphanIsPending = pendingDestructiveIds.containsAnyKey(
+                        messageId: orphaned.messageId,
+                        rfc822MessageId: orphaned.rfc822MessageId
+                    )
+                    if orphanIsPending {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[MoveTrace] fullSync — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
+                        }
+                        continue
+                    }
+                    // The v2final orphan-reclaim fail-closed shape remains, but
+                    // RFC agreement is no longer authority. An IMAP row whose
+                    // membership moved away from this folder cannot prove this
+                    // folder-native address, even when the RFC ids agree.
+                    let orphanOriginal = orphaned
+                    guard Self.providerAddressOwnershipProven(
+                        row: orphaned, accountId: accountId,
+                        folderPath: folderPath, folderId: folderId,
+                        messageId: header.messageId, canonicalId: header.id,
+                        windowMode: windowMode,
+                        sourceBoundEpoch: sourceBoundEpoch
+                    ) else {
+                        orphaned.observedUidValidity = nil
+                        _ = try orphaned.updateChanges(db, from: orphanOriginal)
+                        BackgroundSyncLogger.log("[Sync] orphan reclaim REFUSED for \(orphaned.id) (folder=\(folderPath), survivor folderId=\(orphaned.folderId)) — provider-address ownership is unproven")
+                        continue
+                    }
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] Reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folderId)")
+                    }
+                    orphaned.folderId = folderId
+                    orphaned.folderPath = folderPath
+                    // Cross-mailbox optimistic ownership is ambiguous until
+                    // the destination sync proves a native address (T5.11).
+                    orphaned.observedUidValidity = nil
+                    orphaned.isInInbox = isInInbox
+                    orphaned.messageId = header.messageId
+                    orphaned.isRead = header.isRead
+                    orphaned.isFlagged = header.isFlagged
+                    orphaned.date = header.date
+                    orphaned.providerDate = header.providerDate
+                    orphaned.from = header.from
+                    orphaned.fromAddress = header.fromAddress
+                    orphaned.to = header.to
+                    orphaned.cc = header.cc
+                    orphaned.bcc = header.bcc
+                    orphaned.replyTo = header.replyTo
+                    // RFC Message-ID is metadata only. A nil/empty incoming value
+                    // carries no signal and must never NULL the stored one.
+                    if normalizedIncomingRfc822 != nil {
+                        orphaned.rfc822MessageId = header.rfc822MessageId
+                    }
+                    orphaned.isReplied = orphaned.isReplied || header.isReplied
+                    orphaned.isForwarded = orphaned.isForwarded || header.isForwarded
+                    orphaned.subject = header.subject
+                    orphaned.snippet = header.snippet
+                    orphaned.hasAttachments = header.hasAttachments
+                    orphaned.actionTag = header.actionTag
+                    orphaned.tagSortOrder = header.tagSortOrder
+                    try orphaned.update(db)
+                    // Update user label associations for reclaimed orphan
+                    for labelId in info.userLabelIds {
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: orphaned.id, userLabelId: labelRow.id)
+                            .insert(db, onConflict: .ignore)
+                    }
+                    newHeaders.append(orphaned)
+                    // In-place UPDATE of an existing row, never an insert.
+                    reclaimedIds.append(orphaned.id)
+                } else {
+                    // Defensive — the pending-op filter above should have already
+                    // skipped optimistic-move rows whose id PK collides with this
+                    // header.id, but rfc822-nil remote info can still slip through
+                    // (UID match fails when info has no rfc822). Skip rather than
+                    // throw UNIQUE — sync converges on the next cycle.
+                    guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
+                        if folder.role == .drafts {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] DraftInsert: SKIPPED id=\(header.id) — already exists (remoteSnippet=\(String(header.snippet.prefix(60))))")
+                            }
+                        } else {
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[MoveTrace] fullSync — SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
+                            }
+                        }
+                        continue
+                    }
+                    try header.insert(db)
+                    if folder.role == .drafts {
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] DraftInsert: INSERTED id=\(header.id) msgId=\(header.messageId) rfc822=\(header.rfc822MessageId ?? "nil") snippet=\(String(header.snippet.prefix(60)))")
+                        }
+                    }
+                    try ThreadUtils.insertMessageReferences(for: header, db: db)
+                    // Insert user label associations
+                    for labelId in info.userLabelIds {
+                        let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
+                        try labelRow.insert(db, onConflict: .ignore)
+                        // The join FK is `userLabel.id` — the account-prefixed SURROGATE, never
+                        // the bare provider value (D10 / `IOS-LABEL-001`).
+                        try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
+                            .insert(db, onConflict: .ignore)
+                    }
+                    newHeaders.append(header)
+                    insertedIds.append(header.id)
+                }
+            }
+
+            // Sent-folder reply discovery: a message in this batch is the user's
+            // own reply (sent from another device); flip the parent's isReplied
+            // locally. No-op when folder.role != .sent.
+            let discoveredParents = try ReplyParentResolver.markParentsReplied(
+                inReplyTos: messages.map(\.inReplyTo),
+                folderRole: folder.role,
+                accountId: accountId,
+                db: db
+            )
+            replyDetectIds.append(contentsOf: discoveredParents)
+
+            // AI cache TTL touch removed from sync transaction — it was holding the
+            // GRDB writer lock for 300+ row UPDATEs during every folder sync, blocking
+            // MainActor user actions. TTL is now refreshed lazily after AI queue drains
+            // (see ActiveAIQueue.onDrainComplete).
+
+            // DIAGNOSTIC: per-folder upsert breakdown. `noop` should now dominate for
+            // steady-state re-syncs (Archive/etc.) — it counts the redundant writes the
+            // change-detection above eliminated. A stuck-high `upd` with unchanged mail
+            // fingerprints an always-dirty column to normalize.
+            var upsertLine: String?
+            if upsUpdated + upsNoop + upsDraftSentSkip > 0 || !newHeaders.isEmpty {
+                let loopMs = Int((CFAbsoluteTimeGetCurrent() - upsLoopT0) * 1000)
+                BootProfiler.mark("fullSync upsert[\(folder.name)]: ins=\(newHeaders.count) upd=\(upsUpdated) noop=\(upsNoop) dsSkip=\(upsDraftSentSkip) stale=\(staleIds.count) loop=\(loopMs)ms recon=\(Int(upsReconSeconds * 1000))ms")
+                // WHICH rows, not just how many. The `ins=` count above is exactly
+                // what the reappearing-message investigation (`IOS-QUEUE-008`) had
+                // and could not use: it proves a full sync inserted N rows but not
+                // whether the message the user had just deleted was one of them.
+                // Two segments, ALWAYS both, so a reader never wonders whether one
+                // was omitted: `inserted` lists the rows this pass INSERTED
+                // (`insertedIds`) and `reclaimed` lists the existing rows it
+                // re-homed into this folder in place (`reclaimedIds`, the
+                // orphan-reclaim arm) — for `IOS-QUEUE-008` the MORE interesting
+                // event, a locally moved row the server disagreed with, reported
+                // as what it is rather than as an insert (R4-RS-1).
+                // Debug-gated and file-backed on `.queue`, so it interleaves with
+                // the drain's `queueLog` lines in the one `tabmail.log` and
+                // `AppLogStore.read(channel: .queue)` returns both halves in append
+                // order. ⚠️ NOT on the always-on `.sync` channel: one channel may
+                // carry only one lifetime policy (memory topic 122, `IOS-LOG-002`).
+                // A no-op unless debug logging is unlocked by an allowed user — it
+                // IS active on device / TestFlight for such a user, which is the
+                // point (global `CLAUDE.md` rule 12).
+                //
+                // RENDERED here, EMITTED only after `dbPool.write` has returned —
+                // see the `logQueue` call below the closure. `AppLogStore.append`
+                // enqueues file I/O that no SQLite ROLLBACK can retract, so a line
+                // written from inside the transaction would survive a COMMIT
+                // failure (I/O error, full disk) and name ids for rows that never
+                // became durable. The line therefore rides the closure's return
+                // tuple, nil when the pass emits nothing, and a thrown write never
+                // reaches the emission at all. The rendering is a pure static
+                // function so BOTH its branches can be unit-tested; it is cheap
+                // (two capped joins), and `logQueue` still checks the gate, so a
+                // closed gate still writes nothing.
+                upsertLine = "[MoveTrace] fullSync upsert[\(folder.name)] — "
+                    + SyncEngine.upsertInsertedIdSummary(insertedIds)
+                    + " | "
+                    + SyncEngine.upsertInsertedIdSummary(reclaimedIds, verb: "reclaimed")
+            }
+            return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys, headerRekeys, upsertLine)
+        }
+        let writeMs = Int((CFAbsoluteTimeGetCurrent() - writeStart) * 1000)
+        if writeMs > 30 {
+            BootProfiler.mark("fullSync write[\(folder.name)]: \(messages.count) msg in \(writeMs)ms")
+        }
+        // Reached only when the write above COMMITTED: a rolled-back pass throws
+        // past this point and reports nothing (R4-RS-1).
+        if let upsertLine = syncResult.upsertLine {
+            BackgroundSyncLogger.logQueue(upsertLine)
+        }
+
+        return SyncMessagesResult(
+            newHeaders: syncResult.newHeaders,
+            staleIds: syncResult.staleIds,
+            replyDetectIds: syncResult.replyDetectIds,
+            uidMigratedOldIds: syncResult.uidMigratedOldIds,
+            ftsRekeys: syncResult.ftsRekeys,
+            headerRekeys: syncResult.headerRekeys
+        )
+    }
+}

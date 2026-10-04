@@ -1,0 +1,340 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+import GRDB
+
+enum OutboxStatus: String, Codable, Sendable {
+    case queued
+    case sending
+    case failed
+}
+
+struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
+    static let databaseTableName = "outboxMessage"
+
+    var id: String
+    var accountId: String
+    var toJSON: String
+    var ccJSON: String
+    var bccJSON: String
+    var subject: String
+    var body: String
+    var isHTML: Bool
+    var inReplyTo: String?
+    var referencesJSON: String?
+    /// Gmail native conversation id (reply/forward). Persisted so a drain after
+    /// app relaunch re-sends with the same thread binding. Gmail REST send only;
+    /// nil for IMAP/Exchange and new compositions. See ADR-IOS-043. (v60)
+    var threadId: String?
+    /// Relative directory name under outbox_attachments/ (same as id)
+    var attachmentsDirName: String?
+    var status: String
+    var errorMessage: String?
+    var retryCount: Int
+    var createdAt: Date
+    /// MessageHeader.id of the original message — used to update isReplied/isForwarded after send
+    var originalMessageHeaderId: String?
+    /// Whether this is a forward (vs reply)
+    var isForward: Bool
+    /// Timestamp set immediately after provider.send() succeeds, BEFORE the DB delete.
+    /// Allows reconcileOutbox to distinguish "crashed mid-send" from "crashed after
+    /// send succeeded" — the latter is deleted (not re-queued) to prevent double-sends.
+    var sentAt: Date?
+    /// RFC822 Message-ID generated before send — used to dedup IMAP Sent append on retry.
+    /// Set before SMTP send so both SMTP and IMAP APPEND use the same Message-ID.
+    var sentMessageId: String?
+    /// Whether the sent message has been appended to the server's Sent folder.
+    /// For IMAP: explicitly appended via IMAP APPEND. For Gmail/Exchange: auto-saved by API.
+    /// Outbox message is only deleted when BOTH sentAt != nil AND appendedToSent == true.
+    var appendedToSent: Bool = false
+    /// Server draft ID captured from local Draft table before deletion.
+    /// Used to delete the server draft after send confirmation in drainOutbox.
+    var serverDraftId: String?
+    /// ⚠️ `draftRfc822MessageId` USED TO BE DECLARED HERE (v71) and was removed
+    /// 2026-08-05. It carried the DRAFT's own RFC 822 Message-ID, snapshotted at
+    /// queue-send time, so the post-send backstops could name the Drafts copy by
+    /// an identity rather than by the bare IMAP UID `IMAPProvider.saveDraft`
+    /// returns. `e0d3d30e0` ("Bind draft mutations to provider UID, epoch, and
+    /// generation") replaced that identity-search cleanup with the strong
+    /// address+epoch arm below, and from that commit onward NO production code
+    /// read or wrote the property — it survived only as a declaration, a
+    /// migration, and comments in the present tense describing a mechanism that
+    /// no longer existed.
+    ///
+    /// The COLUMN stays: `v71_addOutboxDraftRfc822MessageId` remains registered
+    /// and inert (a migration is immutable once applied), and GRDB's `Codable`
+    /// decoding ignores a column no property claims. Do not re-add the property
+    /// to "use up" the column; if a future cleanup needs a draft identity, decide
+    /// on its own merits whether identity or address+epoch is the right key —
+    /// `e0d3d30e0`'s answer was address+epoch, for the wrong-sibling reason
+    /// spelled out immediately below.
+    ///
+    /// The UIDVALIDITY epoch `serverDraftId` was minted under, snapshotted at
+    /// queue-send time from `Draft.serverDraftUidValidity` in the same caller
+    /// snapshot as `serverDraftId`. (v72)
+    ///
+    /// This column gives the backstops the epoch their ADDRESS belongs to, which
+    /// is what `e0d3d30e0` made the cleanup resolve on. Identity alone was never
+    /// enough: two legitimately distinct drafts can share a Message-ID
+    /// (a copy, another client's save), so with the identity alone a delete
+    /// issued after its own target has gone — another client removed it, or the
+    /// primary delete already did — finds exactly one remaining exact match, the
+    /// SIBLING, and destroys it. That is a wrong-message delete. With the epoch
+    /// the same delete resolves through `IMAPProvider.deleteDraft`'s STRONG arm:
+    /// live UIDVALIDITY must equal this value, and a target that is already gone
+    /// is a clean no-op.
+    ///
+    /// nil for non-IMAP providers, for a draft that was never pushed, and for
+    /// any row written before v72. For an IMAP row a nil epoch means the delete
+    /// cannot be addressed at all and REFUSES (`actionIdentityResolutionFailed`);
+    /// for Gmail/Graph the address is a stable epoch-free resource id and nothing
+    /// is missing.
+    ///
+    /// ⚠️ **THAT REFUSAL IS TERMINAL, NOT RETRYABLE — this said "a retryable
+    /// throw" until 2026-08-06.** The error's own declaration says it is
+    /// *"DETERMINISTIC and PRE-WIRE: it cannot change on retry. The drain
+    /// terminalizes it instead"*, and `drainPendingQueue` runs
+    /// `PendingOperation.deleteOne` on it: an adjudicated drop, `IOS-QUEUE-003`
+    /// item 4. The disposition is settled there, not here.
+    ///
+    /// ⚠️ CORRECTED 2026-08-06. This used to say the recorded UID "is FETCHed and
+    /// corroborated" after the epoch check, and that a nil epoch kept the row "on
+    /// the unchanged Message-ID-search arm". Neither exists on v3:
+    /// `deleteDraft(identity:)` accepts only `.imap(folder, uidValidity, uid)` and
+    /// `deleteDraftStrong` states in its own doc that it omits RFC corroboration
+    /// "because v3's typed identity has no RFC leg" — there is no Message-ID-search
+    /// arm left to fall back to. Restoring one would be the banned D4 direction
+    /// (ADR-IOS-068: an RFC 822 Message-ID never selects or authorizes a mutation
+    /// target), which is exactly what the paragraph above argues against, so the
+    /// stale wording contradicted its own point.
+    ///
+    /// Ported from `v2final:TabMail/Models/OutboxMessage.swift`'s
+    /// `draftServerUidValidity` (its migration `v85`).
+    var draftServerUidValidity: Int?
+    /// Immutable compose generation that owns this send.
+    var instanceEpoch: String?
+    /// Gmail contained MESSAGE id, distinct from the draft RESOURCE id.
+    var serverDraftGmailMessageId: String?
+    /// Mailbox component of the strong IMAP cleanup address.
+    var draftServerFolderPath: String?
+    /// Wall-clock deadline before drain is allowed to claim this row. Set by
+    /// queueSend to now + outboxUndoHoldSeconds + outboxClaimBufferSeconds.
+    /// NULL for legacy pre-v49 rows (treated as "no hold" by the drain gate).
+    var holdUntil: Date?
+    /// Draft row id associated with this send. Used at atomic-claim time to
+    /// fire DraftStore.delete — deferred from compose-time so Undo-Send can
+    /// reopen compose with the draft contents intact.
+    var draftId: String?
+
+    // MARK: - Computed accessors
+
+    var to: [String] {
+        get { decodeStringArray(toJSON) }
+        set { toJSON = encodeStringArray(newValue) }
+    }
+
+    var cc: [String] {
+        get { decodeStringArray(ccJSON) }
+        set { ccJSON = encodeStringArray(newValue) }
+    }
+
+    var bcc: [String] {
+        get { decodeStringArray(bccJSON) }
+        set { bccJSON = encodeStringArray(newValue) }
+    }
+
+    var references: [String] {
+        get { decodeStringArray(referencesJSON ?? "[]") }
+        set { referencesJSON = encodeStringArray(newValue) }
+    }
+
+    /// F2b §1.3 FAIL-CLOSED decoding: an unknown/garbled stored status maps to
+    /// `.failed` (visible, NON-drainable, explicit-user-retry) — NEVER
+    /// `.queued` (the pre-F2b fallback, which would auto-send a row carrying a
+    /// status this build's `OutboxStatus` does not know — a garbled value, or
+    /// one a newer schema version writes that older code cannot decode). The
+    /// SQL drain/claim selectors filter the RAW string `== queued`, so they
+    /// were already closed; this closes the Swift-side branch too.
+    var outboxStatus: OutboxStatus {
+        OutboxStatus(rawValue: status) ?? .failed
+    }
+
+    // MARK: - Init
+
+    init(
+        accountId: String,
+        draft: DraftMessage,
+        originalMessageHeaderId: String? = nil,
+        isForward: Bool = false
+    ) {
+        self.id = UUID().uuidString
+        self.accountId = accountId
+        self.toJSON = encodeStringArray(draft.to)
+        self.ccJSON = encodeStringArray(draft.cc)
+        self.bccJSON = encodeStringArray(draft.bcc)
+        self.subject = draft.subject
+        self.body = draft.body
+        self.isHTML = draft.isHTML
+        self.inReplyTo = draft.inReplyTo
+        self.referencesJSON = encodeStringArray(draft.references)
+        self.threadId = draft.threadId
+        self.attachmentsDirName = draft.attachments.isEmpty ? nil : self.id
+        self.status = OutboxStatus.queued.rawValue
+        self.errorMessage = nil
+        self.retryCount = 0
+        self.createdAt = Date()
+        self.originalMessageHeaderId = originalMessageHeaderId
+        self.isForward = isForward
+        self.instanceEpoch = nil
+        self.serverDraftGmailMessageId = nil
+        self.draftServerFolderPath = nil
+    }
+
+    // MARK: - Attachment Disk Storage
+
+    /// Base directory for all outbox attachments.
+    static var attachmentsBaseDir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TabMail", isDirectory: true)
+            .appendingPathComponent("outbox_attachments", isDirectory: true)
+    }
+
+    /// Directory for this message's attachments.
+    var attachmentsDir: URL? {
+        guard let dirName = attachmentsDirName else { return nil }
+        return Self.attachmentsBaseDir.appendingPathComponent(dirName, isDirectory: true)
+    }
+
+    /// Save attachments from a DraftMessage to disk.
+    /// Returns the directory name (same as message id) or nil if no attachments.
+    ///
+    /// Throws `AttachmentFilenameError.unsupported` when any attachment's name is
+    /// one the app refuses to use as a path component — checked BEFORE the
+    /// directory is created, so a refused set writes nothing at all. Outbox
+    /// Reliability Rule 5 is satisfied by throwing: `persistQueuedSend` never
+    /// inserts the row, so nothing is ever sent with a wrong or missing
+    /// attachment, and the compose view keeps the user's message on screen.
+    static func saveAttachments(_ attachments: [DraftAttachment], dirName: String) throws {
+        guard !attachments.isEmpty else { return }
+        if let refused = attachments.first(where: { !AttachmentFilename.isSafeFileComponent($0.filename) }) {
+            throw AttachmentFilenameError.unsupported(name: refused.filename)
+        }
+        let dir = attachmentsBaseDir.appendingPathComponent(dirName, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        for (index, attachment) in attachments.enumerated() {
+            // Use index prefix to preserve ordering and avoid filename collisions.
+            // The attachment's own name is used VERBATIM, and the guard above is
+            // what makes that safe: it arrives unchecked from the sender-authored
+            // MIME `filename` parameter, and joining it unchecked made containment
+            // an accident of the index prefix while making a name with a LEADING
+            // or INTERIOR slash (`photos/img.png`) throw a filesystem error —
+            // which fails `queueSend` and leaves the message unsendable with no
+            // usable explanation. NOT any slash-bearing name, which is what this
+            // comment said until 2026-08-12: a trailing slash is dropped by
+            // `appendingPathComponent`, so `report/` stored as `0_report`. Same
+            // predicate, same reason, as the draft store; see
+            // `AttachmentFilename.isSafeFileComponent`, whose doc carries the
+            // measured breakdown.
+            let filename = "\(index)_\(attachment.filename)"
+            let fileURL = dir.appendingPathComponent(filename)
+            try attachment.data.write(to: fileURL)
+
+            // Save metadata (mimeType + flags) as a sidecar
+            let metaURL = dir.appendingPathComponent("\(filename).meta")
+            var meta = attachment.mimeType
+            if attachment.isAlternative { meta += "\nisAlternative" }
+            try meta.write(to: metaURL, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Load attachments from disk back into DraftAttachment array.
+    /// Throws if any attachment file cannot be read — sending an email with missing
+    /// attachments is silent data corruption and must be prevented.
+    func loadAttachments() throws -> [DraftAttachment] {
+        guard let dir = attachmentsDir else { return [] }
+        let files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+
+        // A ".meta" file is a metadata SIDECAR iff its base (name minus ".meta") is a
+        // present file — mirrors DraftAttachmentStorage.loadAttachments (fixed in
+        // 6c4f973). The old naive `!hasSuffix(".meta")` filter treated a REAL
+        // attachment literally named `*.meta` (stored `<idx>_x.meta`, sidecar
+        // `<idx>_x.meta.meta`) as a sidecar and SILENTLY DROPPED it, sending the email
+        // WITHOUT that attachment (silent data corruption — Outbox Rule 5).
+        // The `.meta` test is SCALAR-WISE, via the one shared decision both stores
+        // use: `hasSuffix`/`dropLast` compare `Character`s, and a trailing
+        // `Prepend` scalar grapheme-merges with the following "." so the suffix
+        // test silently answered false — the sidecar was then loaded as a DATA
+        // file and its metadata bytes were SENT as an extra attachment, while the
+        // fail-closed guard below (which asked the same question) never fired.
+        // See `DraftAttachmentStorage.metaBase`.
+        let allNames = Set(files.map { $0.lastPathComponent })
+        func isSidecar(_ name: String) -> Bool {
+            DraftAttachmentStorage.metaBase(name).map(allNames.contains) ?? false
+        }
+        let dataFiles = files.filter { !isSidecar($0.lastPathComponent) }
+        // Fail closed on a DATA file whose name ends in ".meta" but whose OWN sidecar
+        // ("<name>.meta") is absent: indistinguishable from a lost-data orphan, so
+        // THROW rather than send an email with a missing/wrong attachment.
+        for url in dataFiles where DraftAttachmentStorage.metaBase(url.lastPathComponent) != nil {
+            guard allNames.contains(url.lastPathComponent + ".meta") else {
+                throw DraftAttachmentLoadError.ambiguousMetaFilename(name: url.lastPathComponent)
+            }
+        }
+        // Sorted by index prefix.
+        let attachmentFiles = dataFiles.sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        return try attachmentFiles.map { fileURL in
+            let data = try Data(contentsOf: fileURL)
+            let metaURL = fileURL.appendingPathExtension("meta")
+            let metaContent = (try? String(contentsOf: metaURL, encoding: .utf8)) ?? "application/octet-stream"
+            let metaLines = metaContent.components(separatedBy: "\n")
+            let mimeType = metaLines[0]
+            let isAlternative = metaLines.contains("isAlternative")
+            // Strip the index prefix to recover original filename. Scalar-wise —
+            // a `Character`-wise strip handed the store's own `0_` prefix back as
+            // the sender's name, or cut the front off it, for any filename
+            // beginning with a combining mark. This name goes on the wire.
+            // See `DraftAttachmentStorage.afterIndexPrefix`.
+            let filename = fileURL.lastPathComponent
+            let originalName = DraftAttachmentStorage.afterIndexPrefix(filename)
+            return DraftAttachment(filename: originalName, mimeType: mimeType, data: data, isAlternative: isAlternative)
+        }
+    }
+
+    /// Delete attachment directory from disk.
+    func deleteAttachments() {
+        guard let dir = attachmentsDir else { return }
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// Reconstruct a DraftMessage from this outbox entry.
+    /// Throws if attachment files cannot be loaded — prevents sending with missing attachments.
+    func toDraftMessage() throws -> DraftMessage {
+        DraftMessage(
+            to: to,
+            cc: cc,
+            bcc: bcc,
+            subject: subject,
+            body: body,
+            isHTML: isHTML,
+            inReplyTo: inReplyTo,
+            references: references,
+            attachments: try loadAttachments(),
+            threadId: threadId
+        )
+    }
+}
+
+// MARK: - JSON Helpers
+
+func encodeStringArray(_ array: [String]) -> String {
+    (try? String(data: JSONEncoder().encode(array), encoding: .utf8)) ?? "[]"
+}
+
+func decodeStringArray(_ json: String) -> [String] {
+    guard let data = json.data(using: .utf8) else { return [] }
+    return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+}

@@ -1,0 +1,165 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+
+enum PushConfig {
+    /// Base URL for push notification worker API.
+    /// Always production — Gmail Pub/Sub delivers to a single endpoint (push.tabmail.ai),
+    /// so device registrations must be in the same KV that the prod webhook handler reads.
+    /// The apnsSandbox flag handles APNs environment routing (sandbox vs production).
+    /// Same rationale as CLAUDE.md rules #9 (one shared backend entitlement store) and #10 (single Stripe).
+    static let baseURL = "https://disabled.invalid"
+
+    /// Whether to use APNs sandbox or production — derived from the build's
+    /// ACTUAL `aps-environment` entitlement (read once from
+    /// `embedded.mobileprovision`), NOT `#if DEBUG`.
+    ///
+    /// Why not `#if DEBUG`: a Release-config build installed directly on device,
+    /// or a development-signed archive, is DEBUG-undefined yet ships
+    /// `aps-environment=development` (so iOS hands it a SANDBOX token). Trusting
+    /// `#if DEBUG` there reports `false` (production), so the worker sends that
+    /// sandbox token to the PRODUCTION APNs host — Apple accepts it (200) but
+    /// SILENTLY DROPS delivery and the Push Console shows "device doesn't exist".
+    /// That's the class of bug that made smart push never arrive on dev/Release
+    /// builds. App Store builds have no embedded profile (Apple strips it) → we
+    /// fall back to `#if DEBUG` (release ⇒ production), which is correct there.
+    /// TestFlight keeps a profile with `aps-environment=production` → production.
+    static let isAPNsSandbox: Bool = {
+        if let apsEnv = apsEnvironmentFromEmbeddedProfile() {
+            return apsEnv == "development"
+        }
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }()
+
+    /// Extract `Entitlements.aps-environment` from the app's embedded
+    /// provisioning profile. The file is a CMS-signed blob with the profile
+    /// plist embedded as plaintext between `<plist …>` and `</plist>`. Returns
+    /// nil when there's no profile (App Store builds) or it can't be parsed.
+    private static func apsEnvironmentFromEmbeddedProfile() -> String? {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return apsEnvironment(fromProfileBytes: data)
+    }
+
+    /// Slice the plaintext plist region out of a CMS-signed provisioning profile
+    /// and read `Entitlements.aps-environment` from it. Split out of
+    /// `apsEnvironmentFromEmbeddedProfile` so the slicing is reachable from tests
+    /// without a bundle; the bundle read stays in the caller and is not injectable.
+    static func apsEnvironment(fromProfileBytes data: Data) -> String? {
+        // isoLatin1 is byte-preserving, so the binary CMS wrapper doesn't
+        // corrupt the ASCII plist region we slice out below.
+        guard let raw = String(data: data, encoding: .isoLatin1),
+              let lo = raw.range(of: "<plist"),
+              // Bounded to start after the opening tag. Unbounded, the two
+              // searches are independent and a `</plist>` that ENDS before
+              // `<plist` begins yields a reversed Range, which `String`
+              // subscripting TRAPS on — an uncatchable precondition failure.
+              // `<plist` cannot match inside `</plist>` (the `/` blocks it), so
+              // the two can cross. Falling through to `nil` here is the existing
+              // "no usable profile" outcome, not a new behaviour.
+              let hi = raw.range(of: "</plist>", range: lo.upperBound..<raw.endIndex) else { return nil }
+        let plistText = String(raw[lo.lowerBound..<hi.upperBound])
+        guard let plistData = plistText.data(using: .isoLatin1),
+              let obj = try? PropertyListSerialization.propertyList(from: plistData, options: [], format: nil),
+              let dict = obj as? [String: Any],
+              let entitlements = dict["Entitlements"] as? [String: Any],
+              let apsEnv = entitlements["aps-environment"] as? String else { return nil }
+        return apsEnv
+    }
+
+    // MARK: - UserDefaults Keys
+
+    /// Stable device identifier (UUID, generated once).
+    static let deviceIdKey = "push_device_id"
+
+    /// Last registered APNs device token (hex string).
+    static let lastDeviceTokenKey = "push_last_device_token"
+
+    /// List of account emails currently registered with the push worker.
+    static let registeredEmailsKey = "push_registered_emails"
+
+    /// Compact, retryable cleanup debt for accounts whose authoritative local
+    /// row has been removed. It retains only remote keys and local artifact IDs,
+    /// never credentials or content, and is deleted at a proven terminal state.
+    static let removedAccountCleanupKey = "push_removed_account_cleanup_v1"
+
+    /// Whether push notifications are enabled (user-facing setting).
+    /// Default: true. When disabled, the push worker registration still happens
+    /// but the NSE suppresses all non-error notifications.
+    static let pushNotificationsEnabledKey = "push_notifications_enabled"
+
+    /// Whether the NSE filtering entitlement is active (Apple-approved).
+    /// When true, the NSE can fully suppress notifications (return empty content).
+    /// When false, non-actionable pushes are delivered as passive "Inbox updated".
+    /// Flip this to true once Apple grants com.apple.developer.usernotifications.filtering.
+    static let nseFilteringApproved = false
+
+    // MARK: - Constants
+
+    /// Maximum time (seconds) to spend processing a silent push before returning.
+    /// iOS kills the app after ~30s — we return early at 25s to leave headroom.
+    static let silentPushDeadlineSeconds: TimeInterval = 25
+
+    /// Per-account timeout for the foreground consent-status scan. Cold-launch
+    /// RTT (DNS + TLS + server warm-up) regularly exceeds 3s, so the prior
+    /// 3s budget produced false-positive "needs re-consent" flashes on the
+    /// first scan at app boot. 10s leaves headroom without making the
+    /// foreground scan feel laggy (runs in parallel across accounts anyway).
+    static let consentStatusCheckTimeoutSeconds: TimeInterval = 10
+
+    /// Upper bound on how long sign-out waits for the removed-account cleanup
+    /// flush before clearing the session anyway (IOS-PUSH-001).
+    ///
+    /// The flush only runs when this session actually owns cleanup debt, which
+    /// is rare, and it is best-effort: the debt is durable and idempotent, so
+    /// exceeding the bound costs nothing that the same user's next sign-in
+    /// cannot recover. A record's drain is at most four sequential worker
+    /// round-trips (device route, consent, provider unsubscribe, legacy device
+    /// refresh), so 5s covers the warm case with headroom while keeping the
+    /// worst-case Sign Out delay short. Seconds beyond that buy little: a
+    /// network that is still failing at 5s will not recover by 8s, and the
+    /// debt survives either way.
+    static let signOutCleanupFlushTimeoutSeconds: TimeInterval = 5
+
+    /// Upper bound on how long sign-out waits for its own release handshake —
+    /// this device's worker registration, then this session's server-side
+    /// logout — before clearing the local session anyway.
+    ///
+    /// The handshake runs on every ordinary sign-out and is best-effort. THIS
+    /// CLIENT issues at most two sequential round-trips (worker
+    /// `DELETE /register-device`, then GoTrue `POST /auth/v1/logout?scope=local`),
+    /// but two client legs are not two units of work: the release does
+    /// non-trivial work on the server — removing this install's per-account
+    /// routes, and releasing the durable per-token state behind them — and the
+    /// bearer may first need a token refresh. 10s is a best-effort budget, not
+    /// a latency guarantee. That is acceptable because the bound fails CLOSED:
+    /// it ends the wait, never the sign-out, which is also why nothing is
+    /// retried or persisted here.
+    ///
+    /// Why 10s and not the flush's 5s (issue #110, owner decision 2026-09-03):
+    /// a sign-out a few seconds after a COLD launch competes with startup for
+    /// the network and the main actor, and at 5s the bound expired between the
+    /// two legs — the release landed and the logout was cancelled, leaving the
+    /// server-side session to expire on its own. The warm-app path finished
+    /// both legs inside 5s. Doubling the budget covers the cold case; the
+    /// dashboard shows a progress indicator on the Sign Out control for the
+    /// whole window so the longer wait reads as work in progress rather than
+    /// a frozen button. Seconds beyond that buy little for the same reason as
+    /// the flush above: a network still failing at 10s will not recover by 15s.
+    ///
+    /// A release that does not finish in time leaves the registration in place
+    /// on the worker. On the currently deployed worker the server-side nets that
+    /// eventually retire such a registration are narrow: the next account to
+    /// claim the same APNs token displaces the older registration, and APNs
+    /// feedback retires it once the app is uninstalled. A general server-side
+    /// staleness sweep is NOT deployed yet — it lands with the push worker's
+    /// half of this work, and once deployed it becomes the standing backstop
+    /// this bound leans on.
+    static let signOutHandshakeTimeoutSeconds: TimeInterval = 10
+}

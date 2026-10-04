@@ -1,0 +1,38 @@
+name: Web Admin
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web-admin/**"
+      - ".github/workflows/web-admin.yml"
+  pull_request:
+    paths:
+      - "web-admin/**"
+      - ".github/workflows/web-admin.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web-admin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web-admin/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - uses: actions/upload-artifact@v5
+        with:
+          name: tempo-mail-web-admin
+          path: web-admin/dist
+

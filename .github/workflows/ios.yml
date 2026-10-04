@@ -1,0 +1,39 @@
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Create CI configuration
+        run: cp Secrets.xcconfig.example Secrets.xcconfig
+      - name: Generate project
+        run: DEVELOPMENT_TEAM= xcodegen generate --spec project.yml
+      - name: Build for simulator
+        run: >-
+          xcodebuild
+          -project TEMPOMail.xcodeproj
+          -scheme TabMail
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO
+          build
+

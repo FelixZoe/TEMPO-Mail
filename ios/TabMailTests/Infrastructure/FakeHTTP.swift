@@ -1,0 +1,535 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Foundation
+import Synchronization
+
+/// URLProtocol-based HTTP mock for provider tests.
+///
+/// Usage:
+/// ```swift
+/// let http = FakeHTTP.Scenario()
+/// defer { http.close() }
+/// http.register(
+///     path: "/messages/m-1",
+///     method: "GET",
+///     response: .json(fixture: "Gmail/message-nested-eml.json")
+/// )
+/// let provider = GmailProvider(
+///     userEmail: "user@example.com",
+///     accessToken: { _ in "tok" },
+///     session: http.session
+/// )
+/// // ... exercise provider; assertions check marker HTML / attachments.
+/// ```
+///
+/// Matching is path-prefix + method. The longest matching prefix wins; for
+/// equal-length matches, the first registration wins. Unmatched requests return
+/// HTTP 599 with an explanatory body so test output pinpoints the missing fixture.
+///
+/// Fixtures live under `TabMailTests/Fixtures/` and are sourced from the cited
+/// reference URLs in `Fixtures/README.md`. NEVER author fixtures from memory.
+final class FakeHTTP: URLProtocol, @unchecked Sendable {
+
+    private static let scopeHeader = "X-TabMail-Test-HTTP-Scope"
+
+    // MARK: - Registration API
+
+    /// Canned response for a matched request.
+    struct CannedResponse: Sendable {
+        let statusCode: Int
+        let headers: [String: String]
+        let body: Data
+        let transportErrorCode: URLError.Code?
+        /// Non-nil when the real response is PRODUCED LATER, off the transport's
+        /// loader thread — see `parked(_:)`.
+        let parked: (@Sendable () -> CannedResponse)?
+
+        private init(
+            statusCode: Int,
+            headers: [String: String],
+            body: Data,
+            transportErrorCode: URLError.Code? = nil,
+            parked: (@Sendable () -> CannedResponse)? = nil
+        ) {
+            self.statusCode = statusCode
+            self.headers = headers
+            self.body = body
+            self.transportErrorCode = transportErrorCode
+            self.parked = parked
+        }
+
+        /// A response a handler wants to WITHHOLD until something else happens —
+        /// a test releasing a gate, typically — without holding the transport
+        /// while it waits.
+        ///
+        /// 🚨 THIS EXISTS BECAUSE BLOCKING INSIDE A HANDLER BLOCKS THE WHOLE
+        /// TRANSPORT, NOT JUST ITS OWN REQUEST. `URLProtocol.startLoading()` is
+        /// synchronous and runs on a loader thread the session owns; a handler
+        /// that sleeps or waits there occupies that thread. Whether a *different*
+        /// concurrent request then gets a loader thread of its own is a
+        /// scheduling race, so a test that parks one request and asserts on a
+        /// second one is order-dependent: it passes when the second request wins
+        /// the race to the transport and hangs until the release when it does
+        /// not. That is exactly how `OutlookQueueHandoffTests`' failed-account
+        /// requeue test flaked (measured 3 red in 8 standalone runs).
+        ///
+        /// `produce` is therefore evaluated on a background queue: it may block
+        /// for as long as it likes, the loader thread returns immediately, and
+        /// every other route keeps being served. The handler still runs its own
+        /// synchronous part — call counting, one-shot budgets — on the loader
+        /// thread before parking, so ordering of what was RECEIVED is unchanged;
+        /// only the production of this one response moves.
+        static func parked(_ produce: @escaping @Sendable () -> CannedResponse) -> CannedResponse {
+            CannedResponse(statusCode: 0, headers: [:], body: Data(), parked: produce)
+        }
+
+        /// Build a JSON response from a fixture file in `TabMailTests/Fixtures/`.
+        /// Path is relative to the `Fixtures/` root, e.g. `"Gmail/message.json"`.
+        static func json(fixture path: String, statusCode: Int = 200) -> CannedResponse {
+            let url = Bundle(for: FakeHTTP.self).url(forResource: "Fixtures/" + path, withExtension: nil)
+                ?? Bundle(for: FakeHTTP.self).resourceURL?.appendingPathComponent(path)
+                ?? URL(fileURLWithPath: "/dev/null")
+            let data = (try? Data(contentsOf: url)) ?? Data()
+            return CannedResponse(
+                statusCode: statusCode,
+                headers: ["Content-Type": "application/json"],
+                body: data
+            )
+        }
+
+        /// Build a JSON response from a raw string literal (synthetic, for tests
+        /// that don't warrant a full fixture file).
+        static func json(raw: String, statusCode: Int = 200) -> CannedResponse {
+            CannedResponse(
+                statusCode: statusCode,
+                headers: ["Content-Type": "application/json"],
+                body: Data(raw.utf8)
+            )
+        }
+
+        /// Build a response with arbitrary binary body (e.g. a file attachment).
+        static func bytes(_ data: Data, contentType: String = "application/octet-stream", statusCode: Int = 200) -> CannedResponse {
+            CannedResponse(
+                statusCode: statusCode,
+                headers: ["Content-Type": contentType],
+                body: data
+            )
+        }
+
+        /// Build a response with given status code only (for testing error paths).
+        static func status(_ code: Int) -> CannedResponse {
+            CannedResponse(statusCode: code, headers: [:], body: Data())
+        }
+
+        /// Arbitrary status + response headers + body, for a handler that must
+        /// control a header the factories above do not model — a CalDAV `ETag`,
+        /// say, without which a provider's next conditional request cannot be
+        /// exercised at all.
+        static func raw(
+            statusCode: Int,
+            headers: [String: String] = [:],
+            body: Data = Data()
+        ) -> CannedResponse {
+            CannedResponse(statusCode: statusCode, headers: headers, body: body)
+        }
+
+        /// Fail the request at the URL-loading boundary without fabricating an
+        /// HTTP response. This pins provider behavior for real transport errors.
+        static func transportError(_ code: URLError.Code) -> CannedResponse {
+            CannedResponse(
+                statusCode: 0,
+                headers: [:],
+                body: Data(),
+                transportErrorCode: code
+            )
+        }
+    }
+
+    /// Immutable request snapshot passed to a stateful test response handler.
+    /// The handler remains synchronous because `URLProtocol.startLoading()` is
+    /// synchronous; mutable provider models should protect their state with
+    /// `Mutex`, just like the fake's own registry.
+    struct Request: Sendable {
+        let method: String
+        let url: URL
+        let body: Data?
+        /// Every header the request carried, verbatim. Needed by handlers that
+        /// must model a CONDITIONAL request — a WebDAV/CalDAV `PUT` whose
+        /// `If-Match` / `If-None-Match` decides between 200 and 412 — because a
+        /// handler that cannot see the precondition cannot distinguish "create
+        /// only" from "overwrite" and silently blesses either one.
+        let headers: [String: String]
+
+        /// Case-insensitive lookup. HTTP field names are case-insensitive
+        /// (RFC 9110 §5.1) and `URLSession` normalises some of them on the way
+        /// out, so a test that indexed `headers` directly would be asserting on
+        /// Foundation's capitalisation rather than on the request.
+        func header(_ name: String) -> String? {
+            headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+        }
+    }
+
+    fileprivate enum RegisteredResponse: Sendable {
+        case canned(CannedResponse)
+        case dynamic(@Sendable (Request) -> CannedResponse)
+
+        func response(for request: Request) -> CannedResponse {
+            switch self {
+            case .canned(let response): response
+            case .dynamic(let handler): handler(request)
+            }
+        }
+    }
+
+    private struct Matcher: Sendable {
+        let method: String
+        let pathPrefix: String
+        let response: RegisteredResponse
+    }
+
+    private struct State: Sendable {
+        var matchers: [Matcher] = []
+        /// Records every request the fake served — test assertions can verify a
+        /// fallback call was made (e.g. Exchange's second-round
+        /// `microsoft.graph.itemattachment/item/attachments` call) or inspect an
+        /// exact provider payload at the HTTP boundary.
+        var calls: [(method: String, url: String, body: Data?)] = []
+    }
+
+    fileprivate final class StateBox: Sendable {
+        private let state = Mutex(State())
+
+        func register(path: String, method: String, response: RegisteredResponse) {
+            state.withLock { value in
+                value.matchers.append(Matcher(
+                    method: method.uppercased(),
+                    pathPrefix: path,
+                    response: response
+                ))
+            }
+        }
+
+        func take(
+            method: String, url: URL, body: Data?, headers: [String: String]
+        ) -> CannedResponse? {
+            let registered: RegisteredResponse? = state.withLock { value in
+                value.calls.append((method: method.uppercased(), url: url.absoluteString, body: body))
+                var best: (length: Int, response: RegisteredResponse)?
+                for matcher in value.matchers {
+                    guard matcher.method == method.uppercased() else { continue }
+                    let hit = url.path.hasPrefix(matcher.pathPrefix)
+                        || url.absoluteString.contains(matcher.pathPrefix)
+                    guard hit else { continue }
+                    if best == nil || matcher.pathPrefix.count > best!.length {
+                        best = (matcher.pathPrefix.count, matcher.response)
+                    }
+                }
+                return best?.response
+            }
+            return registered?.response(for: Request(
+                method: method.uppercased(),
+                url: url,
+                body: body,
+                headers: headers
+            ))
+        }
+
+        func recordedCalls() -> [(method: String, url: String, body: Data?)] {
+            state.withLock { $0.calls }
+        }
+
+        func reset() {
+            state.withLock { value in
+                value.matchers.removeAll()
+                value.calls.removeAll()
+            }
+        }
+    }
+
+    private static let registry = Mutex<[String: StateBox]>([:])
+
+    /// Per-test HTTP namespace. Its registrations, request log, and reset/close
+    /// lifecycle cannot affect another scenario, even when both URLSessions
+    /// request the same method and URL concurrently.
+    final class Scenario: @unchecked Sendable {
+        fileprivate let id: String
+        fileprivate let box: StateBox
+        private let isClosed = Mutex(false)
+
+        let session: URLSession
+
+        init() {
+            let id = UUID().uuidString
+            self.id = id
+            self.box = StateBox()
+            self.session = FakeHTTP.makeSession(scopeID: id)
+            FakeHTTP.registry.withLock { $0[id] = box }
+        }
+
+        fileprivate init(id: String) {
+            self.id = id
+            self.box = StateBox()
+            self.session = FakeHTTP.makeSession(scopeID: id)
+            FakeHTTP.registry.withLock { $0[id] = box }
+        }
+
+        func register(path: String, method: String = "GET", response: CannedResponse) {
+            box.register(path: path, method: method, response: .canned(response))
+        }
+
+        /// Register a synchronous stateful response. The handler runs outside
+        /// FakeHTTP's registry lock, so it may safely own an independent Mutex
+        /// model and derive each response from prior requests.
+        func register(
+            path: String,
+            method: String = "GET",
+            handler: @escaping @Sendable (Request) -> CannedResponse
+        ) {
+            box.register(path: path, method: method, response: .dynamic(handler))
+        }
+
+        func recordedCalls() -> [(method: String, url: String, body: Data?)] {
+            box.recordedCalls()
+        }
+
+        /// `"<METHOD> <path>"` for every request this scenario RECEIVED, in
+        /// order — a whole-sequence oracle for tests that must prove WHICH
+        /// requests reached the fake, not merely that some did.
+        ///
+        /// RECEIVED, not "served": `StateBox.take` appends to `calls` BEFORE it
+        /// looks for a matcher, so a request with no registered route appears
+        /// here too even though the fake answered it `599` rather than serving
+        /// it. That is what these tests want — an unexpected request must show
+        /// up in the sequence and fail the comparison, not vanish because
+        /// nothing was registered for it — but it is not what the word "served"
+        /// says, so this comment says the other one.
+        ///
+        /// `recordedCalls().contains { … }` cannot do that job: a request that
+        /// escaped to the live endpoint leaves no record, and if any sibling
+        /// leg re-issues the same method and path the `contains` still matches
+        /// and the escape passes unnoticed. Comparing the full sequence makes
+        /// an extra, missing, or reordered request a failure.
+        ///
+        /// The query string is dropped deliberately — these assertions are
+        /// about which SESSION carried the request, and paths are the stable
+        /// part of that.
+        ///
+        /// ⚑ NO REFERENCE — INVENTED. `v2final:TabMailTests/Infrastructure/FakeHTTP.swift`
+        /// has no `servedCallSequence` (verified: the identifier does not occur
+        /// in that file at the tag). Its tests assert over `recordedCalls()`
+        /// directly, which is the shape this method exists to replace.
+        func servedCallSequence() -> [String] {
+            recordedCalls().map { call in
+                "\(call.method) \(URL(string: call.url)?.path ?? call.url)"
+            }
+        }
+
+        func reset() {
+            box.reset()
+        }
+
+        /// Invalidates this scenario's session and unregisters only this
+        /// scenario. Safe to call more than once and from `defer`.
+        func close() {
+            let shouldClose = isClosed.withLock { closed in
+                guard !closed else { return false }
+                closed = true
+                return true
+            }
+            guard shouldClose else { return }
+
+            session.invalidateAndCancel()
+            box.reset()
+            FakeHTTP.registry.withLock { values in
+                guard values[id] === box else { return }
+                _ = values.removeValue(forKey: id)
+            }
+        }
+
+        deinit {
+            close()
+        }
+    }
+
+    /// A deterministic canned-response SEQUENCE for one route: each call pops
+    /// the next status code, and `served` records what actually left the fake.
+    ///
+    /// Exists so a test can drive a specific control-flow LEG of a provider
+    /// method — a 401 retry, a 404 fallback — instead of only its happy path,
+    /// and can then assert on the responses that genuinely arrived rather than
+    /// on the ones it hoped would. That second half is what makes such a test
+    /// falsifiable: if the request under test bypassed the injected session,
+    /// its scripted response is still sitting unserved.
+    ///
+    /// Once the script is exhausted every further call gets `599`, so an
+    /// unexpected extra request is loud rather than silently absorbed by a
+    /// repeated last entry.
+    ///
+    /// ⚑ NO REFERENCE — INVENTED. `v2final:TabMailTests/Infrastructure/FakeHTTP.swift`
+    /// has no `ResponseScript` (verified: the identifier does not occur in that
+    /// file at the tag) and no per-leg response sequencing of any kind — the
+    /// reference's registrations are all single fixed responses, which is why
+    /// it could never pin a 401-retry or 404-fallback leg separately from the
+    /// happy path.
+    final class ResponseScript: Sendable {
+        private let remaining: Mutex<[Int]>
+        private let servedBox = Mutex<[Int]>([])
+
+        init(_ statuses: [Int]) {
+            remaining = Mutex(statuses)
+        }
+
+        /// Pop the next scripted status and record it as served.
+        func next() -> Int {
+            let status = remaining.withLock { queue -> Int in
+                queue.isEmpty ? 599 : queue.removeFirst()
+            }
+            servedBox.withLock { $0.append(status) }
+            return status
+        }
+
+        /// The statuses this route actually returned, in order.
+        var served: [Int] { servedBox.withLock { $0 } }
+    }
+
+    /// Transitional namespace for the still-serialized Exchange mock suite.
+    /// New and migrated tests must use `Scenario` instead of these static APIs.
+    private static let legacyScenario = Scenario(id: "legacy")
+
+    /// Register a canned response. Matched on `httpMethod` + URL path-prefix.
+    static func register(path: String, method: String = "GET", response: CannedResponse) {
+        legacyScenario.register(path: path, method: method, response: response)
+    }
+
+    /// Record a call and return the response, if any matcher fits.
+    ///
+    /// Match rule: longest `pathPrefix` wins. A path-prefix OR substring-of-
+    /// `absoluteString` match is accepted (so query strings in registrations,
+    /// e.g. `"/messages/m-1?format=full"`, work too). Longest-prefix is
+    /// important because a generic `/attachments` registration must not
+    /// swallow more specific `/attachments/{id}?$expand=...` calls.
+    fileprivate static func take(
+        request: URLRequest,
+        method: String,
+        url: URL,
+        body: Data?
+    ) -> CannedResponse? {
+        let box: StateBox?
+        if let scopeID = request.value(forHTTPHeaderField: scopeHeader) {
+            box = registry.withLock { $0[scopeID] }
+        } else {
+            box = legacyScenario.box
+        }
+        return box?.take(
+            method: method,
+            url: url,
+            body: body,
+            headers: request.allHTTPHeaderFields ?? [:]
+        )
+    }
+
+    /// Return every request the fake has served so far.
+    static func recordedCalls() -> [(method: String, url: String, body: Data?)] {
+        legacyScenario.recordedCalls()
+    }
+
+    /// Clear all registrations and call log. Call in each test's teardown.
+    static func reset() {
+        legacyScenario.reset()
+    }
+
+    /// Build a `URLSession` that routes through this protocol.
+    static func makeSession() -> URLSession {
+        makeSession(scopeID: legacyScenario.id)
+    }
+
+    private static func makeSession(scopeID: String) -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [FakeHTTP.self] + (config.protocolClasses ?? [])
+        config.httpAdditionalHeaders = [scopeHeader: scopeID]
+        return URLSession(configuration: config)
+    }
+
+    // MARK: - URLProtocol overrides
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return fail(code: 400, body: "no url") }
+        let method = request.httpMethod ?? "GET"
+
+        guard let canned = FakeHTTP.take(
+            request: request,
+            method: method,
+            url: url,
+            body: Self.bodyData(from: request)
+        ) else {
+            return fail(code: 599, body: "FakeHTTP: no matcher for \(method) \(url)")
+        }
+
+        // PARKED: produce the response off the loader thread so this request
+        // cannot starve any other route while it waits. See `parked(_:)`.
+        if let produce = canned.parked {
+            DispatchQueue.global().async { [self] in
+                deliver(produce(), url: url)
+            }
+            return
+        }
+
+        deliver(canned, url: url)
+    }
+
+    /// Hand a finished response to the URL loading system. Split out of
+    /// `startLoading()` so the parked path completes through exactly the same
+    /// callbacks in exactly the same order.
+    private func deliver(_ canned: CannedResponse, url: URL) {
+        if let transportErrorCode = canned.transportErrorCode {
+            client?.urlProtocol(self, didFailWithError: URLError(transportErrorCode))
+            return
+        }
+
+        let http = HTTPURLResponse(
+            url: url,
+            statusCode: canned.statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: canned.headers
+        )!
+        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: canned.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    private static func bodyData(from request: URLRequest) -> Data? {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return nil }
+
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return data
+    }
+
+    private func fail(code: Int, body: String) {
+        let url = request.url ?? URL(string: "about:blank")!
+        let http = HTTPURLResponse(
+            url: url,
+            statusCode: code,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/plain"]
+        )!
+        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+}
