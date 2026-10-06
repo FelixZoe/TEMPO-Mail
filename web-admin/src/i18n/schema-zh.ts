@@ -1372,6 +1372,8 @@ const phrases: Array<[RegExp, string]> = [
   [/\bDepth\b/g, '深度'],
   [/\baggregate\b/gi, '聚合'],
   [/\bfeedback\b/gi, '反馈'],
+  [/\band\b/gi, '和'],
+  [/\bblob\b/gi, '二进制对象'],
 ];
 
 const translatableKeys = new Set([
