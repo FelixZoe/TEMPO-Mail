@@ -1363,6 +1363,15 @@ const phrases: Array<[RegExp, string]> = [
   [/\bHostname\b/gi, '主机名'],
   [/\bAll\b/gi, '全部'],
   [/\bList\b/gi, '列表'],
+  [/\bmailing lists\b/gi, '邮件列表'],
+  [/\bOAuth clients?\b/gi, 'OAuth 客户端'],
+  [/\bregistered\b/gi, '已注册的'],
+  [/\band their\b/gi, '及其'],
+  [/\bDiscard\b/g, '丢弃'],
+  [/\bReject\b/g, '拒绝'],
+  [/\bDepth\b/g, '深度'],
+  [/\baggregate\b/gi, '聚合'],
+  [/\bfeedback\b/gi, '反馈'],
 ];
 
 const translatableKeys = new Set([
