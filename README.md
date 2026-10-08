@@ -1,6 +1,6 @@
 # TEMPO Mail
 
-TEMPO Mail 是一个从零实现、面向自托管邮件服务的原生 iOS 客户端。它不再基于 TabMail，也不会复用其代码。
+TEMPO Mail 是一个从零实现、面向自托管邮件服务的原生 iOS 客户端。
 
 ## 产品边界
 
