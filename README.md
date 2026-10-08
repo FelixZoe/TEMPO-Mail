@@ -24,6 +24,7 @@ open TEMPOMail.xcodeproj
 ```
 
 部署目标为 iOS 26。当前仓库可在 Windows 上编辑，但最终编译、签名和真机验证必须在 macOS/Xcode 中完成。
+应用图标的矢量主文件是 `Design/AppIcon.svg`，Xcode 使用由它导出的 1024×1024 `AppIcon.png`。
 每次推送到 `main`、提交拉取请求或手动运行工作流时，GitHub Actions 会在 macOS 26/Xcode 26 上：
 
 1. 使用 XcodeGen 重新生成工程；

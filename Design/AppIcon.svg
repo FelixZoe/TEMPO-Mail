@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">TEMPO Mail app icon</title>
+  <desc id="description">A minimal warm-white envelope outline on a near-black background.</desc>
+  <rect width="1024" height="1024" fill="#050505"/>
+  <g fill="none" stroke="#F7F7F5" stroke-width="42" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="210" y="286" width="604" height="452" rx="92"/>
+    <path d="M244 342 512 548 780 342"/>
+  </g>
+</svg>
