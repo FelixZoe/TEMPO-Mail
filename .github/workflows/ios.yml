@@ -86,7 +86,9 @@ jobs:
 
       - name: Package unsigned IPA
         run: |
-          APP_PATH="$(find build/TEMPOMail.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -print -quit)"
+          APP_ROOT="$DERIVED_DATA/Build/Intermediates.noindex/ArchiveIntermediates/$SCHEME/InstallationBuildProductsLocation/Applications"
+          test -d "$APP_ROOT"
+          APP_PATH="$(find "$APP_ROOT" -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$APP_PATH"
           mkdir -p build/Payload
           ditto "$APP_PATH" "build/Payload/$(basename "$APP_PATH")"
