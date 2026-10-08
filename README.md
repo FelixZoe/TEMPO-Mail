@@ -28,7 +28,7 @@ open TEMPOMail.xcodeproj
 
 1. 使用 XcodeGen 重新生成工程；
 2. 自动选择可用的 iPhone 模拟器并运行单元测试；
-3. 构建设备归档；
+3. 构建 Release 设备版本并验证应用可执行文件；
 4. 上传无签名 `TEMPOMail-unsigned.ipa`、SHA-256 校验文件及构建日志。
 
 无签名 IPA 用于后续自签名或检查产物，不可直接作为 App Store 安装包。正式签名需要单独配置 Apple Distribution 证书和描述文件。

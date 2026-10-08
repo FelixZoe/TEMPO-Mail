@@ -70,26 +70,31 @@ jobs:
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             | tee build/test.log
 
-      - name: Build unsigned device archive
+      - name: Build unsigned device app
         run: |
-          xcodebuild archive \
+          xcodebuild build \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
+            -configuration Release \
             -destination 'generic/platform=iOS' \
-            -archivePath build/TEMPOMail.xcarchive \
             -derivedDataPath "$DERIVED_DATA" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=NO \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
-            | tee build/archive.log
+            | tee build/device-build.log
 
       - name: Package unsigned IPA
         run: |
-          APP_ROOT="$DERIVED_DATA/Build/Intermediates.noindex/ArchiveIntermediates/$SCHEME/InstallationBuildProductsLocation/Applications"
+          APP_ROOT="$DERIVED_DATA/Build/Products/Release-iphoneos"
           test -d "$APP_ROOT"
           APP_PATH="$(find "$APP_ROOT" -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$APP_PATH"
+          EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          test -n "$EXECUTABLE"
+          test -x "$APP_PATH/$EXECUTABLE"
+          file "$APP_PATH/$EXECUTABLE" | tee build/product.txt
+          du -sh "$APP_PATH" | tee -a build/product.txt
           mkdir -p build/Payload
           ditto "$APP_PATH" "build/Payload/$(basename "$APP_PATH")"
           ditto -c -k --sequesterRsrc --keepParent build/Payload build/TEMPOMail-unsigned.ipa
@@ -103,7 +108,8 @@ jobs:
             build/TEMPOMail-unsigned.ipa
             build/TEMPOMail-unsigned.ipa.sha256
             build/test.log
-            build/archive.log
+            build/device-build.log
+            build/product.txt
           if-no-files-found: error
           retention-days: 14
 
