@@ -1,14 +1,14 @@
 import SwiftUI
 
 struct AdministrationView: View {
-    private enum Section: String, CaseIterable, Identifiable {
+    private enum ManagementArea: String, CaseIterable, Identifiable {
         case accounts = "账户"
         case temporary = "临时邮箱"
         var id: Self { self }
     }
 
     @Environment(AppModel.self) private var model
-    @State private var section: Section = .accounts
+    @State private var section: ManagementArea = .accounts
     @State private var searchText = ""
     @State private var isPresentingCreation = false
     @State private var accountPendingDeletion: ManagedAccount?
@@ -39,7 +39,7 @@ struct AdministrationView: View {
             }
             .safeAreaInset(edge: .top) {
                 Picker("管理内容", selection: $section) {
-                    ForEach(Section.allCases) { item in Text(item.rawValue).tag(item) }
+                    ForEach(ManagementArea.allCases) { item in Text(item.rawValue).tag(item) }
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal)
