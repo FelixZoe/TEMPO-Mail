@@ -57,6 +57,7 @@ jobs:
 
       - name: Run unit tests
         run: |
+          set -o pipefail
           mkdir -p build
           xcrun simctl boot "${{ steps.simulator.outputs.id }}" 2>/dev/null || true
           xcrun simctl bootstatus "${{ steps.simulator.outputs.id }}" -b
@@ -72,6 +73,7 @@ jobs:
 
       - name: Build unsigned device app
         run: |
+          set -o pipefail
           xcodebuild build \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
@@ -119,4 +121,16 @@ jobs:
         with:
           name: TEMPOMail-test-results-${{ github.run_number }}
           path: build/TestResults.xcresult
+          retention-days: 7
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEMPOMail-build-logs-${{ github.run_number }}
+          path: |
+            build/test.log
+            build/device-build.log
+            build/product.txt
+          if-no-files-found: ignore
           retention-days: 7

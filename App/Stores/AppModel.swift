@@ -11,13 +11,13 @@ final class AppModel {
     var refreshGeneration = 0
 
     init(
-        accounts: AccountStore = AccountStore(),
-        mail: MailStore = MailStore(),
-        ota: OTAConfigurationStore = OTAConfigurationStore()
+        accounts: AccountStore? = nil,
+        mail: MailStore? = nil,
+        ota: OTAConfigurationStore? = nil
     ) {
-        self.accounts = accounts
-        self.mail = mail
-        self.ota = ota
+        self.accounts = accounts ?? AccountStore()
+        self.mail = mail ?? MailStore()
+        self.ota = ota ?? OTAConfigurationStore()
     }
 
     func select(_ account: MailAccount) {
