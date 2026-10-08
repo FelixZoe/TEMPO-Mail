@@ -1,39 +1,114 @@
-name: iOS
+name: Build iOS
 
 on:
   push:
     branches: [main]
-    paths:
-      - "ios/**"
-      - ".github/workflows/ios.yml"
   pull_request:
-    paths:
-      - "ios/**"
-      - ".github/workflows/ios.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT: TEMPOMail.xcodeproj
+  SCHEME: TEMPOMail
+  DERIVED_DATA: ${{ github.workspace }}/build/DerivedData
+
 jobs:
   build:
-    runs-on: macos-15
-    defaults:
-      run:
-        working-directory: ios
-    steps:
-      - uses: actions/checkout@v5
-      - name: Install XcodeGen
-        run: brew install xcodegen
-      - name: Create CI configuration
-        run: cp Secrets.xcconfig.example Secrets.xcconfig
-      - name: Generate project
-        run: DEVELOPMENT_TEAM= xcodegen generate --spec project.yml
-      - name: Build for simulator
-        run: >-
-          xcodebuild
-          -project TEMPOMail.xcodeproj
-          -scheme TabMail
-          -destination 'generic/platform=iOS Simulator'
-          CODE_SIGNING_ALLOWED=NO
-          build
+    name: Test and build
+    runs-on: macos-26
+    timeout-minutes: 30
 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Select an available iPhone simulator
+        id: simulator
+        run: |
+          SIMULATOR_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+          if [[ -z "$SIMULATOR_ID" ]]; then
+            echo "No available iPhone simulator" >&2
+            exit 1
+          fi
+          echo "id=$SIMULATOR_ID" >> "$GITHUB_OUTPUT"
+          echo "Using simulator $SIMULATOR_ID"
+
+      - name: Run unit tests
+        run: |
+          mkdir -p build
+          xcrun simctl boot "${{ steps.simulator.outputs.id }}" 2>/dev/null || true
+          xcrun simctl bootstatus "${{ steps.simulator.outputs.id }}" -b
+          xcodebuild test \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath build/TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            | tee build/test.log
+
+      - name: Build unsigned device archive
+        run: |
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/TEMPOMail.xcarchive \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            | tee build/archive.log
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="$(find build/TEMPOMail.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
+          mkdir -p build/Payload
+          ditto "$APP_PATH" "build/Payload/$(basename "$APP_PATH")"
+          ditto -c -k --sequesterRsrc --keepParent build/Payload build/TEMPOMail-unsigned.ipa
+          shasum -a 256 build/TEMPOMail-unsigned.ipa | tee build/TEMPOMail-unsigned.ipa.sha256
+
+      - name: Upload unsigned build
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEMPOMail-unsigned-${{ github.run_number }}
+          path: |
+            build/TEMPOMail-unsigned.ipa
+            build/TEMPOMail-unsigned.ipa.sha256
+            build/test.log
+            build/archive.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test results on failure
+        if: failure() && hashFiles('build/TestResults.xcresult/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEMPOMail-test-results-${{ github.run_number }}
+          path: build/TestResults.xcresult
+          retention-days: 7

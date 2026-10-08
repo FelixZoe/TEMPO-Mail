@@ -1,0 +1,55 @@
+name: TEMPOMail
+
+options:
+  bundleIdPrefix: one.darker
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+
+targets:
+  TEMPOMail:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: one.darker.tempomail
+        PRODUCT_NAME: TEMPO Mail
+        INFOPLIST_KEY_CFBundleDisplayName: TEMPO Mail
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_UIRequiresFullScreen: false
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: true
+
+  TEMPOMailTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: TEMPOMail
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: one.darker.tempomail.tests
+        GENERATE_INFOPLIST_FILE: true
+
+schemes:
+  TEMPOMail:
+    build:
+      targets:
+        TEMPOMail: all
+        TEMPOMailTests: [test]
+    test:
+      targets:
+        - TEMPOMailTests

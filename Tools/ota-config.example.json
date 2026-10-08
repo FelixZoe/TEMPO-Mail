@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "expiresAt": "2027-01-01T00:00:00Z",
+  "announcement": "",
+  "supportURL": "https://example.com/support",
+  "inboxPageSize": 50,
+  "refreshIntervalSeconds": 300,
+  "features": {
+    "experimentalThreadView": false
+  }
+}
