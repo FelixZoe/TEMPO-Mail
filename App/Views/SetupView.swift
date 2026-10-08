@@ -39,27 +39,29 @@ struct SetupView: View {
                         .textContentType(.password)
                 }
 
-                Section("JMAP 服务") {
-                    TextField("https://mail.example.com/.well-known/jmap", text: $draft.sessionEndpoint)
+                Section("自托管服务") {
+                    TextField("https://mail.example.com", text: $draft.sessionEndpoint)
                         .textContentType(.URL)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
-                    Text("使用 Stalwart 时填写 JMAP Session URL。正式环境只允许 HTTPS。")
+                    Text("填写服务器地址即可；也可以直接填写完整的 JMAP Session URL。正式环境只允许 HTTPS。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("签名 OTA 配置（可选）") {
-                    TextField("配置包 URL", text: $draft.remoteConfigEndpoint)
-                        .textContentType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                    TextField("P-256 X9.63 公钥（Base64）", text: $draft.remoteConfigPublicKey, axis: .vertical)
-                        .textInputAutocapitalization(.never)
-                        .font(.caption.monospaced())
-                    Text("OTA 只更新公告、支持链接、刷新周期等数据，不执行远程代码。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Section {
+                    DisclosureGroup("高级设置") {
+                        TextField("签名配置包 URL（可选）", text: $draft.remoteConfigEndpoint)
+                            .textContentType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.URL)
+                        TextField("P-256 X9.63 公钥（Base64）", text: $draft.remoteConfigPublicKey, axis: .vertical)
+                            .textInputAutocapitalization(.never)
+                            .font(.caption.monospaced())
+                        Text("OTA 只更新公告、支持链接、刷新周期等数据，不执行远程代码。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 if let errorMessage {
@@ -103,7 +105,6 @@ struct SetupView: View {
     private var canConnect: Bool {
         !draft.emailAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !draft.sessionEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !draft.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !draft.password.isEmpty
     }
 

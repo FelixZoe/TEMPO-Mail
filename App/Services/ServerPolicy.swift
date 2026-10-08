@@ -28,6 +28,17 @@ enum ServerPolicy {
         return url
     }
 
+    static func sessionURL(from rawValue: String) throws -> URL {
+        guard let url = try validatedURL(rawValue) else { throw ServerPolicyError.invalidURL }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let path = components?.path ?? ""
+        if path.isEmpty || path == "/" {
+            components?.path = "/.well-known/jmap"
+        }
+        guard let result = components?.url else { throw ServerPolicyError.invalidURL }
+        return result
+    }
+
     static func validateEmail(_ value: String) throws {
         let parts = value.split(separator: "@", omittingEmptySubsequences: false)
         guard parts.count == 2, !parts[0].isEmpty, parts[1].contains(".") else {

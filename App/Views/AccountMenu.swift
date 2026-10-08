@@ -27,6 +27,8 @@ struct AccountMenu: View {
             }
         } label: {
             HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle")
+                    .font(.title3)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(model.accounts.selectedAccount?.displayName ?? "账户")
                         .font(.headline)
@@ -35,7 +37,7 @@ struct AccountMenu: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                Image(systemName: "chevron.up.chevron.down")
+                Image(systemName: "chevron.down")
                     .font(.caption2.weight(.semibold))
             }
         }

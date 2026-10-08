@@ -29,6 +29,7 @@ targets:
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
         INFOPLIST_KEY_UILaunchScreen_Generation: true
         INFOPLIST_KEY_UIRequiresFullScreen: false
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: 连接你配置的自托管邮件服务器
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: true
 

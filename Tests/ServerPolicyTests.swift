@@ -16,6 +16,16 @@ final class ServerPolicyTests: XCTestCase {
         XCTAssertEqual(url.port, 8080)
     }
 
+    func testBuildsJMAPDiscoveryURLFromServerRoot() throws {
+        let url = try ServerPolicy.sessionURL(from: "https://mail.example.com")
+        XCTAssertEqual(url.absoluteString, "https://mail.example.com/.well-known/jmap")
+    }
+
+    func testPreservesExplicitJMAPSessionPath() throws {
+        let url = try ServerPolicy.sessionURL(from: "https://mail.example.com/custom/session")
+        XCTAssertEqual(url.path, "/custom/session")
+    }
+
     func testEmailValidation() {
         XCTAssertNoThrow(try ServerPolicy.validateEmail("person@example.com"))
         XCTAssertThrowsError(try ServerPolicy.validateEmail("not-an-email"))

@@ -27,7 +27,7 @@ actor JMAPClient {
     private let password: String
     private let session: URLSession
 
-    init(account: MailAccount, password: String, session: URLSession = .shared) {
+    init(account: MailAccount, password: String, session: URLSession = NetworkSession.make()) {
         self.account = account
         self.password = password
         self.session = session
@@ -37,7 +37,7 @@ actor JMAPClient {
         endpoint: URL,
         username: String,
         password: String,
-        session: URLSession = .shared
+        session: URLSession = NetworkSession.make()
     ) async throws -> JMAPSession {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"

@@ -53,6 +53,26 @@ enum JSONValue: Codable, Equatable, Sendable {
         guard case .string(let value) = self else { return nil }
         return value
     }
+
+    var boolValue: Bool? {
+        guard case .bool(let value) = self else { return nil }
+        return value
+    }
+
+    var integerValue: Int? {
+        guard case .number(let value) = self else { return nil }
+        return Int(value)
+    }
+
+    var dateValue: Date? {
+        guard let stringValue else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: stringValue) { return date }
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return standard.date(from: stringValue)
+    }
 }
 
 extension JSONValue {

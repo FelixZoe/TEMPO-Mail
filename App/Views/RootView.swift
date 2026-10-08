@@ -11,6 +11,7 @@ struct RootView: View {
                 MailHomeView()
             }
         }
+        .background(Color(.systemBackground).ignoresSafeArea())
         .sheet(isPresented: Binding(
             get: { model.isPresentingAccountSetup },
             set: { model.isPresentingAccountSetup = $0 }

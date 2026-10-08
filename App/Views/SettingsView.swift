@@ -67,6 +67,9 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { AccountMenu() }
+            }
             .confirmationDialog(
                 "删除这个账户？",
                 isPresented: Binding(
@@ -99,6 +102,7 @@ struct SettingsView: View {
     private func remove(_ account: MailAccount) {
         do {
             model.ota.removeCache(for: account)
+            model.administration.removeAccess(for: account)
             try model.accounts.remove(account)
             model.mail.clear()
             pendingRemoval = nil

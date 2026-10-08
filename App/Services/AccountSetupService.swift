@@ -3,11 +3,10 @@ import Foundation
 struct AccountSetupService: Sendable {
     func connect(_ draft: ServerSetupDraft) async throws -> (account: MailAccount, password: String) {
         let email = draft.emailAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-        let username = draft.username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enteredUsername = draft.username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let username = enteredUsername.isEmpty ? email : enteredUsername
         try ServerPolicy.validateEmail(email)
-        guard let sessionURL = try ServerPolicy.validatedURL(draft.sessionEndpoint) else {
-            throw ServerPolicyError.invalidURL
-        }
+        let sessionURL = try ServerPolicy.sessionURL(from: draft.sessionEndpoint)
         let remoteConfigURL = try ServerPolicy.validatedURL(draft.remoteConfigEndpoint, required: false)
         let session = try await JMAPClient.discover(
             endpoint: sessionURL,

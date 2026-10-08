@@ -4,6 +4,7 @@ enum JMAPCapability {
     static let core = "urn:ietf:params:jmap:core"
     static let mail = "urn:ietf:params:jmap:mail"
     static let submission = "urn:ietf:params:jmap:submission"
+    static let management = "urn:stalwart:jmap"
 }
 
 struct JMAPSession: Decodable, Sendable {
