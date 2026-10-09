@@ -69,14 +69,14 @@ async function call(account: MailAccount, password: string, methodCalls: unknown
   return response.json();
 }
 
-export async function fetchMail(account: MailAccount, password: string, role: 'inbox' | 'sent' | 'starred', search = ''): Promise<MailItem[]> {
+export async function fetchMail(account: MailAccount, password: string, role: 'inbox' | 'sent' | 'starred' | 'all', search = ''): Promise<MailItem[]> {
   const client = makeClient(account, password);
   await client.fetchSession();
   const mailbox = await client.mailbox_get({ accountId: account.accountId, ids: null });
   const boxes = mailbox.list ?? [];
   const filter: Record<string, unknown> = {};
   if (role === 'starred') filter.hasKeyword = '$flagged';
-  else filter.inMailbox = boxes.find((item: { role?: string }) => item.role === role)?.id;
+  else if (role !== 'all') filter.inMailbox = boxes.find((item: { role?: string }) => item.role === role)?.id;
   if (search.trim()) filter.text = search.trim();
   const queried = await client.email_query({ accountId: account.accountId, filter, sort: [{ property: 'receivedAt', isAscending: false }], limit: 50 });
   if (!queried.ids.length) return [];

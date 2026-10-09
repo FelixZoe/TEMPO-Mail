@@ -32,6 +32,7 @@ const persist = (accounts: MailAccount[], selectedId: string | null) =>
 
 async function loadAccess(account: MailAccount | null) {
   if (!account) return null;
+  if (account.id === previewAccount.id) return previewAccess;
   const secret = await SecureStore.getItemAsync(`tempo.password.${account.id}`);
   return secret ? adminAccess(account, secret) : null;
 }
@@ -49,7 +50,7 @@ export const useAppState = create<Store>((set, get) => ({
     const saved = raw ? JSON.parse(raw) as { accounts: MailAccount[]; selectedId: string | null } : { accounts: [], selectedId: null };
     const selected = derive(saved.accounts, saved.selectedId, null).selected;
     const access = await loadAccess(selected);
-    set({ ready: true, preview: false, accounts: saved.accounts, selectedId: saved.selectedId, access, ...derive(saved.accounts, saved.selectedId, access) });
+    set({ ready: true, preview: selected?.id === previewAccount.id, accounts: saved.accounts, selectedId: saved.selectedId, access, ...derive(saved.accounts, saved.selectedId, access) });
   },
   async connect(server, email, username, secret) {
     const account = await discover(server, email, username, secret);
@@ -61,6 +62,7 @@ export const useAppState = create<Store>((set, get) => ({
   },
   enterPreview() {
     const accounts = [previewAccount];
+    void persist(accounts, previewAccount.id);
     set({ preview: true, accounts, selectedId: previewAccount.id, access: previewAccess, ...derive(accounts, previewAccount.id, previewAccess) });
   },
   async select(id) {
@@ -68,7 +70,7 @@ export const useAppState = create<Store>((set, get) => ({
     const selected = accounts.find((item) => item.id === id) ?? null;
     const access = await loadAccess(selected);
     await persist(accounts, id);
-    set({ selectedId: id, access, ...derive(accounts, id, access) });
+    set({ preview: selected?.id === previewAccount.id, selectedId: id, access, ...derive(accounts, id, access) });
   },
   async remove(id) {
     await SecureStore.deleteItemAsync(`tempo.password.${id}`);
@@ -82,7 +84,7 @@ export const useAppState = create<Store>((set, get) => ({
   async password() {
     const selected = get().selected;
     if (!selected) throw new Error('没有选择账户');
-    if (get().preview) return 'preview';
+    if (get().preview || selected.id === previewAccount.id) return 'preview';
     const secret = await SecureStore.getItemAsync(`tempo.password.${selected.id}`);
     if (!secret) throw new Error('登录凭据已失效');
     return secret;

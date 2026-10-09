@@ -12,6 +12,7 @@ export function AccountMenu() {
         ))}
         <Divider />
         <Button label="添加账户" systemImage="person.crop.circle.badge.plus" onPress={() => router.push('/setup')} />
+        <Button label="设置" systemImage="gearshape" onPress={() => router.push('/(tabs)/settings')} />
       </Menu>
     </Host>
   );

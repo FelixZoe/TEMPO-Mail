@@ -1,11 +1,12 @@
 import { Button, Host, Picker, Text } from '@expo/ui/swift-ui';
 import { buttonStyle, disabled, frame, pickerStyle, tag } from '@expo/ui/swift-ui/modifiers';
+import type { ComponentProps } from 'react';
 import { StyleProp, ViewStyle } from 'react-native';
 
-export function NativeGlassButton({ label, onPress, prominent = false, isDisabled = false, style }: { label: string; onPress(): void; prominent?: boolean; isDisabled?: boolean; style?: StyleProp<ViewStyle> }) {
+export function NativeGlassButton({ label, systemImage, onPress, prominent = false, isDisabled = false, style }: { label: string; systemImage?: ComponentProps<typeof Button>['systemImage']; onPress(): void; prominent?: boolean; isDisabled?: boolean; style?: StyleProp<ViewStyle> }) {
   return (
     <Host style={[{ height: 48, alignSelf: 'stretch' }, style]} useViewportSizeMeasurement>
-      <Button label={label} onPress={onPress} modifiers={[buttonStyle(prominent ? 'glassProminent' : 'glass'), disabled(isDisabled), frame({ maxWidth: 1000, minHeight: 44 })]} />
+      <Button label={label} systemImage={systemImage} onPress={onPress} modifiers={[buttonStyle(prominent ? 'glassProminent' : 'glass'), disabled(isDisabled), frame({ maxWidth: 1000, minHeight: 44 })]} />
     </Host>
   );
 }

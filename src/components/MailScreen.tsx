@@ -1,61 +1,84 @@
-import { FlashList } from '@shopify/flash-list';
+import { Button as NativeButton, Host, Menu as NativeMenu } from '@expo/ui/swift-ui';
 import { useQuery } from '@tanstack/react-query';
 import { router, Stack } from 'expo-router';
 import { useState } from 'react';
-import { RefreshControl, StyleSheet, View } from 'react-native';
-import { List, Text, useTheme } from 'react-native-paper';
+import { StyleSheet, View } from 'react-native';
+import { useTheme } from 'react-native-paper';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { fetchMail } from '@/api/jmap';
 import { AccountMenu } from '@/components/AccountMenu';
+import { MailList } from '@/components/MailList';
+import { NativeGlassButton } from '@/components/NativeControls';
 import { useAppState } from '@/state/app-state';
 import { previewMail } from '@/preview/fixtures';
-import { Button as NativeButton, Host } from '@expo/ui/swift-ui';
 
-export function MailScreen({ role, title }: { role: 'inbox' | 'starred' | 'sent'; title: string }) {
+type MailRole = 'inbox' | 'starred' | 'sent';
+
+const folders: { role: MailRole; label: string; icon: 'tray' | 'star' | 'paperplane' }[] = [
+  { role: 'inbox', label: '收件箱', icon: 'tray' },
+  { role: 'starred', label: '星标', icon: 'star' },
+  { role: 'sent', label: '已发送', icon: 'paperplane' }
+];
+
+export function MailScreen() {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const { selected, password, preview } = useAppState();
-  const [search, setSearch] = useState('');
+  const [role, setRole] = useState<MailRole>('inbox');
+  const folder = folders.find((item) => item.role === role)!;
   const query = useQuery({
-    queryKey: ['mail', selected?.id, role, search],
+    queryKey: ['mail', selected?.id, role],
     enabled: Boolean(selected),
     queryFn: async () => {
       if (preview) {
-        const query = search.trim().toLowerCase();
         return previewMail.filter((item) => {
           if (role === 'starred' && !item.keywords?.['$flagged']) return false;
           if (role === 'sent') return false;
-          return !query || `${item.subject} ${item.preview} ${item.from?.[0]?.email}`.toLowerCase().includes(query);
+          return true;
         });
       }
-      return fetchMail(selected!, await password(), role, search);
+      return fetchMail(selected!, await password(), role);
     }
   });
   return (
     <View collapsable={false} style={[styles.page, { backgroundColor: theme.colors.background }]}>
       <Stack.Screen options={{
-        title, headerShadowVisible: false,
+        title: folder.label, headerShadowVisible: false,
         headerLeft: () => <AccountMenu />,
-        headerRight: () => <Host matchContents><NativeButton label="写邮件" systemImage="square.and.pencil" onPress={() => router.push('/compose')} /></Host>,
-        headerSearchBarOptions: { placeholder: '搜索邮件', onChangeText: (event) => setSearch(event.nativeEvent.text) }
+        headerRight: () => <MailboxMenu value={role} onChange={setRole} />
       }} />
-      <FlashList
+      <MailList
         data={query.data ?? []}
-        keyExtractor={(item) => item.id}
-        contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={styles.listContent}
-        refreshControl={<RefreshControl refreshing={query.isFetching} onRefresh={() => query.refetch()} />}
-        ItemSeparatorComponent={() => <View style={[styles.separator, { backgroundColor: theme.colors.outlineVariant }]} />}
-        ListEmptyComponent={<Text style={[styles.empty, { color: theme.colors.onSurfaceVariant }]}>{query.error instanceof Error ? query.error.message : '没有邮件'}</Text>}
-        renderItem={({ item }) => <List.Item style={styles.row} titleStyle={!item.keywords?.['$seen'] ? styles.unread : undefined} title={item.from?.[0]?.name || item.from?.[0]?.email || '未知发件人'} description={`${item.subject || '（无主题）'}\n${item.preview || ''}`} descriptionNumberOfLines={2} left={(props) => <List.Icon {...props} color={theme.colors.onSurfaceVariant} icon={item.keywords?.['$seen'] ? 'email-open-outline' : 'email'} />} />}
+        refreshing={query.isFetching}
+        onRefresh={() => void query.refetch()}
+        emptyTitle={`暂无${folder.label}邮件`}
+        emptyDetail="下拉即可重新检查服务器"
+        error={query.error instanceof Error ? query.error.message : undefined}
+      />
+      <NativeGlassButton
+        label="写邮件"
+        systemImage="square.and.pencil"
+        prominent
+        onPress={() => router.push('/compose')}
+        style={[styles.compose, { bottom: Math.max(insets.bottom + 64, 82) }]}
       />
     </View>
   );
 }
 
+function MailboxMenu({ value, onChange }: { value: MailRole; onChange(value: MailRole): void }) {
+  return (
+    <Host matchContents>
+      <NativeMenu label="" systemImage="line.3.horizontal.decrease">
+        {folders.map((item) => (
+          <NativeButton key={item.role} label={item.label} systemImage={value === item.role ? 'checkmark.circle.fill' : item.icon} onPress={() => onChange(item.role)} />
+        ))}
+      </NativeMenu>
+    </Host>
+  );
+}
+
 const styles = StyleSheet.create({
   page: { flex: 1 },
-  listContent: { paddingBottom: 24 },
-  row: { paddingHorizontal: 8, paddingVertical: 4 },
-  unread: { fontWeight: '700' },
-  separator: { height: StyleSheet.hairlineWidth, marginLeft: 72, marginRight: 16 },
-  empty: { padding: 40, textAlign: 'center' }
+  compose: { position: 'absolute', right: 18, width: 124, alignSelf: 'auto', zIndex: 10 }
 });
