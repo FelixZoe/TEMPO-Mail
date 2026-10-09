@@ -23,6 +23,9 @@ jobs:
     env:
       EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
       EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+      EXPO_PUBLIC_DEFAULT_MAIL_SERVER: ${{ vars.EXPO_PUBLIC_DEFAULT_MAIL_SERVER || 'https://mail.darker.one' }}
+      EXPO_PUBLIC_DEFAULT_MAIL_DOMAIN: ${{ vars.EXPO_PUBLIC_DEFAULT_MAIL_DOMAIN || 'darker.one' }}
+      EXPO_PUBLIC_REGISTRATION_URL: ${{ vars.EXPO_PUBLIC_REGISTRATION_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
