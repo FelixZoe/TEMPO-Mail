@@ -1,136 +1,76 @@
-name: Build iOS
+name: Build native iOS runtime
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - package.json
+      - package-lock.json
+      - app.config.ts
+      - eas.json
+      - App/Resources/**
+      - .github/workflows/ios.yml
   pull_request:
-  workflow_dispatch:
+    paths:
+      - package.json
+      - package-lock.json
+      - app.config.ts
+      - eas.json
+      - App/Resources/**
+      - .github/workflows/ios.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: ios-${{ github.workflow }}-${{ github.ref }}
+  group: native-ios-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  PROJECT: TEMPOMail.xcodeproj
-  SCHEME: TEMPOMail
-  DERIVED_DATA: ${{ github.workspace }}/build/DerivedData
 
 jobs:
   build:
-    name: Test and build
     runs-on: macos-26
-    timeout-minutes: 30
-
+    timeout-minutes: 35
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Show build environment
-        run: |
-          sw_vers
-          xcodebuild -version
-          swift --version
-
-      - name: Install XcodeGen
-        run: |
-          if ! command -v xcodegen >/dev/null 2>&1; then
-            brew install xcodegen
-          fi
-          xcodegen --version
-
-      - name: Generate Xcode project
-        run: xcodegen generate --spec project.yml
-
-      - name: Select an available iPhone simulator
-        id: simulator
-        run: |
-          SIMULATOR_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
-          if [[ -z "$SIMULATOR_ID" ]]; then
-            echo "No available iPhone simulator" >&2
-            exit 1
-          fi
-          echo "id=$SIMULATOR_ID" >> "$GITHUB_OUTPUT"
-          echo "Using simulator $SIMULATOR_ID"
-
-      - name: Run unit tests
-        run: |
-          set -o pipefail
-          mkdir -p build
-          xcrun simctl boot "${{ steps.simulator.outputs.id }}" 2>/dev/null || true
-          xcrun simctl bootstatus "${{ steps.simulator.outputs.id }}" -b
-          xcodebuild test \
-            -project "$PROJECT" \
-            -scheme "$SCHEME" \
-            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
-            -derivedDataPath "$DERIVED_DATA" \
-            -resultBundlePath build/TestResults.xcresult \
-            CODE_SIGNING_ALLOWED=NO \
-            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
-            | tee build/test.log
-
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Generate native iOS project
+        env:
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+        run: npx expo prebuild --platform ios --clean --no-install
+      - name: Install CocoaPods
+        run: cd ios && pod install --repo-update
       - name: Build unsigned device app
         run: |
-          set -o pipefail
+          WORKSPACE="$(find ios -maxdepth 1 -name '*.xcworkspace' -print -quit)"
+          SCHEME="$(basename "$WORKSPACE" .xcworkspace)"
           xcodebuild build \
-            -project "$PROJECT" \
+            -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath "$DERIVED_DATA" \
+            -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=NO \
-            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
-            | tee build/device-build.log
-
+            AD_HOC_CODE_SIGNING_ALLOWED=NO
       - name: Package unsigned IPA
         run: |
-          APP_ROOT="$DERIVED_DATA/Build/Products/Release-iphoneos"
-          test -d "$APP_ROOT"
-          APP_PATH="$(find "$APP_ROOT" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          APP_PATH="$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$APP_PATH"
-          EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
-          test -n "$EXECUTABLE"
-          test -x "$APP_PATH/$EXECUTABLE"
-          file "$APP_PATH/$EXECUTABLE" | tee build/product.txt
-          du -sh "$APP_PATH" | tee -a build/product.txt
+          test -x "$APP_PATH/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
           mkdir -p build/Payload
           ditto "$APP_PATH" "build/Payload/$(basename "$APP_PATH")"
-          ditto -c -k --sequesterRsrc --keepParent build/Payload build/TEMPOMail-unsigned.ipa
-          shasum -a 256 build/TEMPOMail-unsigned.ipa | tee build/TEMPOMail-unsigned.ipa.sha256
-
-      - name: Upload unsigned build
-        uses: actions/upload-artifact@v4
+          ditto -c -k --sequesterRsrc --keepParent build/Payload build/TEMPOMail-native-1-unsigned.ipa
+          shasum -a 256 build/TEMPOMail-native-1-unsigned.ipa > build/TEMPOMail-native-1-unsigned.ipa.sha256
+      - uses: actions/upload-artifact@v4
         with:
-          name: TEMPOMail-unsigned-${{ github.run_number }}
+          name: TEMPOMail-native-1-${{ github.run_number }}
           path: |
-            build/TEMPOMail-unsigned.ipa
-            build/TEMPOMail-unsigned.ipa.sha256
-            build/test.log
-            build/device-build.log
-            build/product.txt
-          if-no-files-found: error
+            build/TEMPOMail-native-1-unsigned.ipa
+            build/TEMPOMail-native-1-unsigned.ipa.sha256
           retention-days: 14
-
-      - name: Upload test results on failure
-        if: failure() && hashFiles('build/TestResults.xcresult/**') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: TEMPOMail-test-results-${{ github.run_number }}
-          path: build/TestResults.xcresult
-          retention-days: 7
-
-      - name: Upload build logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: TEMPOMail-build-logs-${{ github.run_number }}
-          path: |
-            build/test.log
-            build/device-build.log
-            build/product.txt
-          if-no-files-found: ignore
-          retention-days: 7

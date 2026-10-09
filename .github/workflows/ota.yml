@@ -1,0 +1,39 @@
+name: Publish TypeScript OTA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - App/**/*.ts
+      - App/**/*.tsx
+      - src/**
+      - OPEN_SOURCE.md
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ota-production
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Publish to production channel
+        if: env.EXPO_TOKEN != '' && env.EXPO_PROJECT_ID != ''
+        run: npx eas-cli@latest update --channel production --platform ios --message "${{ github.sha }}" --non-interactive
+      - name: Explain missing OTA credentials
+        if: env.EXPO_TOKEN == '' || env.EXPO_PROJECT_ID == ''
+        run: echo "TypeScript validated; add EXPO_TOKEN and EXPO_PROJECT_ID repository secrets to publish OTA."

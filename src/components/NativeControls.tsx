@@ -1,0 +1,21 @@
+import { Button, Host, Picker, Text } from '@expo/ui/swift-ui';
+import { buttonStyle, disabled, frame, pickerStyle, tag } from '@expo/ui/swift-ui/modifiers';
+import { StyleProp, ViewStyle } from 'react-native';
+
+export function NativeGlassButton({ label, onPress, prominent = false, isDisabled = false, style }: { label: string; onPress(): void; prominent?: boolean; isDisabled?: boolean; style?: StyleProp<ViewStyle> }) {
+  return (
+    <Host style={[{ height: 48, alignSelf: 'stretch' }, style]} useViewportSizeMeasurement>
+      <Button label={label} onPress={onPress} modifiers={[buttonStyle(prominent ? 'glassProminent' : 'glass'), disabled(isDisabled), frame({ maxWidth: 1000, minHeight: 44 })]} />
+    </Host>
+  );
+}
+
+export function NativeSegmentedControl({ value, onChange, options }: { value: string; onChange(value: string): void; options: { value: string; label: string }[] }) {
+  return (
+    <Host style={{ height: 42, marginHorizontal: 16 }} useViewportSizeMeasurement>
+      <Picker selection={value} onSelectionChange={(selection) => onChange(selection ?? value)} modifiers={[pickerStyle('segmented'), frame({ maxWidth: 1000 })]}>
+        {options.map((option) => <Text key={option.value} modifiers={[tag(option.value)]}>{option.label}</Text>)}
+      </Picker>
+    </Host>
+  );
+}

@@ -1,51 +1,39 @@
 # TEMPO Mail
 
-TEMPO Mail 是一个从零实现、面向自托管邮件服务的原生 iOS 客户端。
+TEMPO Mail 是面向 Stalwart 自托管服务的 iOS 邮件客户端与移动管理端。
 
-## 产品边界
+## 架构边界
 
-- 首次进入前必须配置自定义 JMAP 服务。
-- 支持保存多个账户、快速切换账户、收取/搜索/阅读邮件以及发送邮件。
-- 账户切换固定在页面顶部，点击后沿按钮弹出已登录账户列表和“添加账户”。
-- 使用管理员邮箱登录时自动增加一个“管理”底部导航；普通邮箱不会显示管理入口。
-- 管理模式支持添加、封禁、解封和删除服务器账户，并在服务器支持时管理临时邮箱。
-- 凭据保存在系统 Keychain，普通账户元数据保存在应用容器。
-- 导航栏、底部标签栏、按钮和搜索使用 iOS 26 原生 Liquid Glass。
-- OTA 只更新经过 P-256 签名的配置和文案，不下载或执行代码。
+- TypeScript/React Native：账户流程、邮件内容、管理页、设置和业务状态，可通过 EAS Update OTA 更新。
+- iOS 原生界面：Expo Router Native Tabs、原生 Stack 搜索、`@expo/ui` 的 Menu/Button/Picker。iOS 26 由系统绘制 Liquid Glass。
+- `runtimeVersion` 固定为独立的 `native-1`，不再绑定 App 版本号或 IPA build number。
+- 只有 Swift、权限、Expo 原生依赖或其他原生兼容面变化时才升级 `runtimeVersion` 并重新发 IPA；纯 TypeScript 更新始终复用 `production` OTA 通道。
 
-## 为什么使用 JMAP
+## 产品行为
 
-Stalwart 原生支持 JMAP。与分别维护 IMAP、SMTP 和 IDLE 状态机相比，JMAP 使用 HTTPS 和结构化 JSON，同时覆盖邮箱、邮件查询、正文和提交发送，更适合一个全新、可维护的客户端。
+- 首次进入必须连接自定义 Stalwart/JMAP 服务。
+- 首次配置页提供“不登录，预览界面”，只读取本地示例数据，不保存凭据也不触发网络权限。
+- 顶部账户按钮展开原生小窗，列出已登录账户和“添加账户”。
+- 普通邮箱显示收件箱、星标、已发送、设置。
+- 拥有 `sysAccountGet` 与 `sysAccountQuery` 的邮箱额外显示“管理”底部导航。
+- 管理权限来自服务器，客户端不会伪造管理员身份。
 
-## 开发
+## 开源组件
 
-要求 macOS、Xcode 26 与 XcodeGen：
+协议、列表、缓存、状态和内容组件优先使用维护中的 GitHub 开源项目，详见 [OPEN_SOURCE.md](OPEN_SOURCE.md)。TEMPO 自己只实现 Stalwart 管理扩展适配与产品编排。
+
+## 本地检查
 
 ```sh
-xcodegen generate
-open TEMPOMail.xcodeproj
+npm ci
+npm run typecheck
+npx expo prebuild --platform ios --clean
 ```
 
-部署目标为 iOS 26。当前仓库可在 Windows 上编辑，但最终编译、签名和真机验证必须在 macOS/Xcode 中完成。
-应用图标的矢量主文件是 `Design/AppIcon.svg`，Xcode 使用由它导出的 1024×1024 `AppIcon.png`。
-每次推送到 `main`、提交拉取请求或手动运行工作流时，GitHub Actions 会在 macOS 26/Xcode 26 上：
+## 自动发布
 
-1. 使用 XcodeGen 重新生成工程；
-2. 自动选择可用的 iPhone 模拟器并运行单元测试；
-3. 构建 Release 设备版本并验证应用可执行文件；
-4. 上传无签名 `TEMPOMail-unsigned.ipa`、SHA-256 校验文件及构建日志。
+- `Build native iOS runtime`：仅在原生兼容面发生变化时生成 `native-1` 无签名 IPA，供你使用自己的证书重签。
+- `Publish TypeScript OTA`：TypeScript 路由或 `src/**` 变化时先类型检查，再发布到 `production` 通道。
+- OTA 发布需要仓库 Secrets：`EXPO_TOKEN` 与 `EXPO_PROJECT_ID`。未配置时工作流仍会完成类型检查并明确跳过发布。
 
-无签名 IPA 用于后续自签名或检查产物，不可直接作为 App Store 安装包。正式签名需要单独配置 Apple Distribution 证书和描述文件。
-
-## 自定义服务
-
-首次启动需要输入：
-
-- 显示名称与邮箱地址
-- 自托管服务器地址，例如 `https://mail.example.com`；客户端会自动发现 JMAP Session
-- 登录用户名（可留空并使用邮箱地址）与密码
-- 可选的 OTA 配置 URL 和 P-256 公钥
-
-客户端只接受 HTTPS 服务（开发环境中的 `localhost` 除外）。
-
-管理权限来自当前登录邮箱的 Stalwart 权限，不在客户端内伪造管理员身份。临时邮箱对应 Stalwart Masked Email；服务器版本或权限不支持时，界面会明确显示“未启用”。应用启动不会主动请求系统权限，只有用户点击连接本地服务器时才可能出现 iOS 的本地网络权限提示。
+无签名 IPA 不能直接安装；必须用包含当前设备 UDID 的有效描述文件和对应证书完整重签整个 App bundle。

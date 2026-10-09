@@ -1,4 +1,8 @@
 .DS_Store
+node_modules/
+.expo/
+dist-check/
+ios/
 .build/
 DerivedData/
 *.xcodeproj/
