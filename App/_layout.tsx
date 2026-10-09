@@ -1,19 +1,41 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { Stack } from 'expo-router';
-import { PaperProvider, MD3LightTheme } from 'react-native-paper';
+import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
+import { useMemo } from 'react';
+import { useColorScheme } from 'react-native';
+import { PaperProvider } from 'react-native-paper';
 import { AppStateProvider } from '@/state/app-state';
+import { createTempoTheme } from '@/theme';
 
 const queryClient = new QueryClient();
-const theme = { ...MD3LightTheme, colors: { ...MD3LightTheme.colors, primary: '#111111', secondary: '#555555' } };
 
 export default function RootLayout() {
+  const isDark = useColorScheme() === 'dark';
+  const paperTheme = useMemo(() => createTempoTheme(isDark), [isDark]);
+  const navigationTheme = useMemo(() => {
+    const base = isDark ? DarkTheme : DefaultTheme;
+    return {
+      ...base,
+      colors: {
+        ...base.colors,
+        primary: paperTheme.colors.onBackground,
+        background: paperTheme.colors.background,
+        card: paperTheme.colors.surface,
+        text: paperTheme.colors.onBackground,
+        border: 'transparent',
+        notification: paperTheme.colors.error
+      }
+    };
+  }, [isDark, paperTheme]);
+
   return (
     <QueryClientProvider client={queryClient}>
-      <PaperProvider theme={theme}>
-        <AppStateProvider>
-          <Stack screenOptions={{ headerShown: false }} />
-        </AppStateProvider>
-      </PaperProvider>
+      <ThemeProvider value={navigationTheme}>
+        <PaperProvider theme={paperTheme}>
+          <AppStateProvider>
+            <Stack screenOptions={{ headerShown: false, headerShadowVisible: false, contentStyle: { backgroundColor: paperTheme.colors.background } }} />
+          </AppStateProvider>
+        </PaperProvider>
+      </ThemeProvider>
     </QueryClientProvider>
   );
 }

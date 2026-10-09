@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Stack } from 'expo-router';
 import { useState } from 'react';
 import { Alert, RefreshControl, StyleSheet, View } from 'react-native';
-import { Dialog, Divider, List, Portal, Text, TextInput } from 'react-native-paper';
+import { Dialog, List, Portal, Text, TextInput, useTheme } from 'react-native-paper';
 import {
   createManagedAccount, createTemporaryAddress, deleteManagedAccount, deleteTemporaryAddress,
   fetchManagedAccounts, fetchTemporaryAddresses, setManagedAccountSuspended, setTemporaryAddressEnabled
@@ -19,6 +19,7 @@ const isSuspended = (account: ManagedAccount) =>
   Boolean((account.permissions as any)?.disabledPermissions?.authenticate);
 
 export default function AdminScreen() {
+  const theme = useTheme();
   const { selected, password, preview } = useAppState();
   const queryClient = useQueryClient();
   const [section, setSection] = useState('accounts');
@@ -60,25 +61,30 @@ export default function AdminScreen() {
     if (!preview) { setDialog(null); setEmail(''); setSecret(''); setDescription(''); setPrefix(''); setDomain(''); }
   };
 
+  const separator = () => <View style={[styles.separator, { backgroundColor: theme.colors.outlineVariant }]} />;
+  const inputStyle = [styles.input, { backgroundColor: theme.colors.surfaceVariant }];
+
   return (
-    <View style={styles.page}>
+    <View collapsable={false} style={[styles.page, { backgroundColor: theme.colors.background }]}>
       <Stack.Screen options={{
-        title: '管理', headerLeft: () => <AccountMenu />,
+        title: '管理', headerShadowVisible: false, headerLeft: () => <AccountMenu />,
         headerRight: () => <Host matchContents><NativeButton label="添加" systemImage="plus" onPress={() => setDialog(section === 'accounts' ? 'account' : 'temporary')} /></Host>
       }} />
-      {preview && <Text style={styles.preview}>预览模式 · 所有管理操作只展示交互，不会写入服务器</Text>}
+      {preview && <Text style={[styles.preview, { color: theme.colors.onSurfaceVariant }]}>预览模式 · 管理操作不会写入服务器</Text>}
       <NativeSegmentedControl value={section} onChange={setSection} options={[{ value: 'accounts', label: '账户' }, { value: 'temporary', label: '临时邮箱' }]} />
       {section === 'accounts' ? (
         <FlashList
           data={accounts.data ?? []} keyExtractor={(item) => item.id}
+          contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.listContent}
           refreshControl={<RefreshControl refreshing={accounts.isFetching} onRefresh={() => accounts.refetch()} />}
-          ItemSeparatorComponent={Divider}
-          ListEmptyComponent={<Text style={styles.empty}>{accounts.error instanceof Error ? accounts.error.message : '没有账户或当前权限不足'}</Text>}
+          ItemSeparatorComponent={separator}
+          ListEmptyComponent={<Text style={[styles.empty, { color: theme.colors.onSurfaceVariant }]}>{accounts.error instanceof Error ? accounts.error.message : '没有账户或当前权限不足'}</Text>}
           renderItem={({ item }) => (
             <List.Item
+              style={styles.row}
               title={item.description || item.emailAddress}
               description={`${item.emailAddress}${isSuspended(item) ? ' · 已封禁' : ''}`}
-              left={(props) => <List.Icon {...props} icon={isSuspended(item) ? 'account-cancel-outline' : 'account-circle-outline'} />}
+              left={(props) => <List.Icon {...props} color={theme.colors.onSurfaceVariant} icon={isSuspended(item) ? 'account-cancel-outline' : 'account-circle-outline'} />}
               right={() => <AccountActions item={item} currentEmail={selected?.email} disabled={busy} onSuspend={() => selected && run((passwordValue) => setManagedAccountSuspended(selected, passwordValue, item, !isSuspended(item)))} onDelete={() => selected && Alert.alert('永久删除账户？', item.emailAddress, [{ text: '取消', style: 'cancel' }, { text: '删除', style: 'destructive', onPress: () => void run((passwordValue) => deleteManagedAccount(selected, passwordValue, item.id)) }])} />}
             />
           )}
@@ -86,11 +92,12 @@ export default function AdminScreen() {
       ) : (
         <FlashList
           data={temporary.data ?? []} keyExtractor={(item) => item.id}
+          contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.listContent}
           refreshControl={<RefreshControl refreshing={temporary.isFetching} onRefresh={() => temporary.refetch()} />}
-          ItemSeparatorComponent={Divider}
-          ListEmptyComponent={<Text style={styles.empty}>{temporary.error instanceof Error ? temporary.error.message : '没有临时邮箱，或服务器未启用 Masked Email'}</Text>}
+          ItemSeparatorComponent={separator}
+          ListEmptyComponent={<Text style={[styles.empty, { color: theme.colors.onSurfaceVariant }]}>{temporary.error instanceof Error ? temporary.error.message : '没有临时邮箱，或服务器未启用 Masked Email'}</Text>}
           renderItem={({ item }) => (
-            <List.Item title={item.email} description={`${item.description || '无说明'} · ${item.enabled ? '启用' : '停用'}`} left={(props) => <List.Icon {...props} icon="email-fast-outline" />} right={() => <TemporaryActions item={item} disabled={busy} onToggle={() => selected && run((passwordValue) => setTemporaryAddressEnabled(selected, passwordValue, item, !item.enabled))} onDelete={() => selected && Alert.alert('删除临时邮箱？', item.email, [{ text: '取消', style: 'cancel' }, { text: '删除', style: 'destructive', onPress: () => void run((passwordValue) => deleteTemporaryAddress(selected, passwordValue, item.id)) }])} />} />
+            <List.Item style={styles.row} title={item.email} description={`${item.description || '无说明'} · ${item.enabled ? '启用' : '停用'}`} left={(props) => <List.Icon {...props} color={theme.colors.onSurfaceVariant} icon="email-fast-outline" />} right={() => <TemporaryActions item={item} disabled={busy} onToggle={() => selected && run((passwordValue) => setTemporaryAddressEnabled(selected, passwordValue, item, !item.enabled))} onDelete={() => selected && Alert.alert('删除临时邮箱？', item.email, [{ text: '取消', style: 'cancel' }, { text: '删除', style: 'destructive', onPress: () => void run((passwordValue) => deleteTemporaryAddress(selected, passwordValue, item.id)) }])} />} />
           )}
         />
       )}
@@ -99,13 +106,13 @@ export default function AdminScreen() {
           <Dialog.Title>{dialog === 'account' ? '添加账户' : '添加临时邮箱'}</Dialog.Title>
           <Dialog.Content style={styles.form}>
             {dialog === 'account' ? <>
-              <TextInput mode="outlined" label="完整邮箱地址" value={email} onChangeText={setEmail} autoCapitalize="none" />
-              <TextInput mode="outlined" label="显示名称（可选）" value={description} onChangeText={setDescription} />
-              <TextInput mode="outlined" label="初始密码" value={secret} onChangeText={setSecret} secureTextEntry />
+              <TextInput style={inputStyle} mode="flat" underlineColor="transparent" label="完整邮箱地址" value={email} onChangeText={setEmail} autoCapitalize="none" />
+              <TextInput style={inputStyle} mode="flat" underlineColor="transparent" label="显示名称（可选）" value={description} onChangeText={setDescription} />
+              <TextInput style={inputStyle} mode="flat" underlineColor="transparent" label="初始密码" value={secret} onChangeText={setSecret} secureTextEntry />
             </> : <>
-              <TextInput mode="outlined" label="前缀（留空自动生成）" value={prefix} onChangeText={setPrefix} autoCapitalize="none" />
-              <TextInput mode="outlined" label="邮箱域名（留空使用默认）" value={domain} onChangeText={setDomain} autoCapitalize="none" />
-              <TextInput mode="outlined" label="用途说明" value={description} onChangeText={setDescription} />
+              <TextInput style={inputStyle} mode="flat" underlineColor="transparent" label="前缀（留空自动生成）" value={prefix} onChangeText={setPrefix} autoCapitalize="none" />
+              <TextInput style={inputStyle} mode="flat" underlineColor="transparent" label="邮箱域名（留空使用默认）" value={domain} onChangeText={setDomain} autoCapitalize="none" />
+              <TextInput style={inputStyle} mode="flat" underlineColor="transparent" label="用途说明" value={description} onChangeText={setDescription} />
             </>}
           </Dialog.Content>
           <Dialog.Actions><NativeGlassButton label="取消" onPress={() => setDialog(null)} /><NativeGlassButton label={busy ? '正在创建…' : '创建'} prominent isDisabled={busy} onPress={() => void create()} /></Dialog.Actions>
@@ -124,4 +131,13 @@ function TemporaryActions({ item, disabled, onToggle, onDelete }: { item: Tempor
   return <Host matchContents><NativeMenu label="" systemImage="ellipsis.circle"><NativeButton label={item.enabled ? '停用' : '启用'} systemImage={item.enabled ? 'pause.circle' : 'play.circle'} onPress={disabled ? undefined : onToggle} /><NativeButton label="删除" systemImage="trash" role="destructive" onPress={disabled ? undefined : onDelete} /></NativeMenu></Host>;
 }
 
-const styles = StyleSheet.create({ page: { flex: 1, backgroundColor: '#fff' }, preview: { paddingHorizontal: 16, paddingVertical: 10, color: '#666' }, empty: { padding: 32, textAlign: 'center' }, form: { gap: 12 } });
+const styles = StyleSheet.create({
+  page: { flex: 1 },
+  preview: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 2 },
+  listContent: { paddingBottom: 24 },
+  row: { paddingHorizontal: 8, paddingVertical: 3 },
+  separator: { height: StyleSheet.hairlineWidth, marginLeft: 72, marginRight: 16 },
+  empty: { padding: 40, textAlign: 'center' },
+  form: { gap: 10 },
+  input: { borderRadius: 15, overflow: 'hidden' }
+});
