@@ -14,7 +14,7 @@ export default function TabLayout() {
     >
       <NativeTabs.Trigger name="inbox"><NativeTabs.Trigger.Icon sf={{ default: 'tray', selected: 'tray.fill' }} /><NativeTabs.Trigger.Label>收件箱</NativeTabs.Trigger.Label></NativeTabs.Trigger>
       <NativeTabs.Trigger name="admin" hidden={!admin}><NativeTabs.Trigger.Icon sf="person.2.badge.gearshape" /><NativeTabs.Trigger.Label>管理</NativeTabs.Trigger.Label></NativeTabs.Trigger>
-      <NativeTabs.Trigger name="search"><NativeTabs.Trigger.Icon sf="magnifyingglass" /><NativeTabs.Trigger.Label>搜索</NativeTabs.Trigger.Label></NativeTabs.Trigger>
+      <NativeTabs.Trigger name="search" role="search"><NativeTabs.Trigger.Icon sf="magnifyingglass" /><NativeTabs.Trigger.Label>搜索</NativeTabs.Trigger.Label></NativeTabs.Trigger>
       <NativeTabs.Trigger name="settings" hidden><NativeTabs.Trigger.Icon sf="gearshape" /><NativeTabs.Trigger.Label>设置</NativeTabs.Trigger.Label></NativeTabs.Trigger>
     </NativeTabs>
   );

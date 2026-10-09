@@ -32,7 +32,10 @@ export default function RootLayout() {
       <ThemeProvider value={navigationTheme}>
         <PaperProvider theme={paperTheme}>
           <AppStateProvider>
-            <Stack screenOptions={{ headerShown: false, headerShadowVisible: false, contentStyle: { backgroundColor: paperTheme.colors.background } }} />
+            <Stack screenOptions={{ headerShown: false, headerShadowVisible: false, contentStyle: { backgroundColor: paperTheme.colors.background } }}>
+              <Stack.Screen name="setup" options={{ headerShown: true }} />
+              <Stack.Screen name="compose" options={{ headerShown: true, presentation: 'modal' }} />
+            </Stack>
           </AppStateProvider>
         </PaperProvider>
       </ThemeProvider>
