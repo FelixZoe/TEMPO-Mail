@@ -132,8 +132,7 @@ export async function fetchManagedAccounts(account: MailAccount, password: strin
 }
 
 async function managementCall(account: MailAccount, password: string, methodCalls: unknown[]) {
-  const origin = new URL(account.sessionUrl).origin;
-  const response = await request(`${origin}/api`, {
+  const response = await request(account.apiUrl, {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: authorization(account.username, password) },
     body: JSON.stringify({ using: ['urn:ietf:params:jmap:core', 'urn:stalwart:jmap'], methodCalls })

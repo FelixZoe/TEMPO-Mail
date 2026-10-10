@@ -1,0 +1,30 @@
+[Unit]
+Description=TEMPO Mail self-service registration API
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=/opt/tempo-mail/secrets/registration.env
+Environment=PORT=8015
+Environment=DATABASE_PATH=/var/lib/tempo-mail-registration/registration.sqlite
+ExecStart=/usr/local/bin/node --no-warnings=ExperimentalWarning /opt/tempo-mail/registration/server.mjs
+Restart=on-failure
+RestartSec=3
+StateDirectory=tempo-mail-registration
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

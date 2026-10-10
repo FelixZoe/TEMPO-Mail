@@ -1,14 +1,15 @@
 import { Button as NativeButton, Host, Image as NativeImage } from '@expo/ui/swift-ui';
 import { router, Stack } from 'expo-router';
 import { useState } from 'react';
-import { Alert, KeyboardAvoidingView, Linking, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { HelperText, Text, TextInput, useTheme } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { DEFAULT_MAIL_DOMAIN, DEFAULT_MAIL_SERVER, DEFAULT_REGISTRATION_URL } from '@/config';
+import { registerDefaultAccount } from '@/api/registration';
 import { NativeGlassButton } from '@/components/NativeControls';
 import { useAppState } from '@/state/app-state';
 
-type Mode = 'welcome' | 'login' | 'custom';
+type Mode = 'welcome' | 'register' | 'login' | 'custom';
 
 export default function Setup() {
   const theme = useTheme();
@@ -18,12 +19,16 @@ export default function Setup() {
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [inviteCode, setInviteCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   const changeMode = (next: Mode) => {
     setError('');
     setPassword('');
+    setConfirmPassword('');
+    setInviteCode('');
     setMode(next);
   };
   const submit = async () => {
@@ -39,11 +44,18 @@ export default function Setup() {
     }
   };
   const register = async () => {
-    if (!DEFAULT_REGISTRATION_URL) {
-      Alert.alert('注册尚未开放', `${DEFAULT_MAIL_DOMAIN} 服务器目前没有公开的自助注册地址。配置注册地址后，这个入口可直接通过 OTA 启用。`);
-      return;
+    if (password !== confirmPassword) return setError('两次输入的密码不一致');
+    setBusy(true);
+    setError('');
+    try {
+      const registeredEmail = await registerDefaultAccount(email, password, inviteCode);
+      await connect(DEFAULT_MAIL_SERVER, registeredEmail, '', password);
+      router.replace('/(tabs)/inbox');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '注册失败');
+    } finally {
+      setBusy(false);
     }
-    await Linking.openURL(DEFAULT_REGISTRATION_URL);
   };
   const preview = () => {
     enterPreview();
@@ -66,7 +78,7 @@ export default function Setup() {
           </View>
         </View>
         <View style={styles.welcomeActions}>
-          <NativeGlassButton label="注册 TEMPO 邮箱" systemImage="person.badge.plus" prominent wide onPress={() => void register()} />
+          <NativeGlassButton label="注册 TEMPO 邮箱" systemImage="person.badge.plus" prominent wide isDisabled={!DEFAULT_REGISTRATION_URL} onPress={() => changeMode('register')} />
           <NativeGlassButton label="邮箱登录" systemImage="envelope" wide onPress={() => changeMode('login')} />
           <Pressable accessibilityRole="button" hitSlop={12} onPress={() => changeMode('custom')} style={styles.textAction}>
             <Text variant="labelLarge" style={{ color: theme.colors.onBackground }}>自定义服务器</Text>
@@ -80,20 +92,21 @@ export default function Setup() {
   }
 
   const custom = mode === 'custom';
+  const registering = mode === 'register';
   return (
     <>
       <Stack.Screen options={{
         headerShown: true,
-        title: custom ? '自定义服务器' : '邮箱登录',
+        title: custom ? '自定义服务器' : registering ? '注册邮箱' : '邮箱登录',
         headerShadowVisible: false,
         headerLeft: () => <Host matchContents><NativeButton label="返回" systemImage="chevron.left" onPress={() => changeMode('welcome')} /></Host>
       }} />
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={[styles.page, { backgroundColor: theme.colors.background }]}>
         <ScrollView contentInsetAdjustmentBehavior="automatic" keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           <View style={styles.heading}>
-            <Text variant="headlineSmall" style={styles.title}>{custom ? '连接你的邮箱服务' : `登录 @${DEFAULT_MAIL_DOMAIN}`}</Text>
+            <Text variant="headlineSmall" style={styles.title}>{custom ? '连接你的邮箱服务' : registering ? `创建 @${DEFAULT_MAIL_DOMAIN}` : `登录 @${DEFAULT_MAIL_DOMAIN}`}</Text>
             <Text variant="bodyMedium" style={[styles.intro, { color: theme.colors.onSurfaceVariant }]}>
-              {custom ? '填写支持 JMAP 的服务地址和邮箱凭据。' : '使用你的完整邮箱地址和密码登录 TEMPO 邮箱。'}
+              {custom ? '填写支持 JMAP 的服务地址和邮箱凭据。' : registering ? '选择邮箱名，输入邀请码后即可创建并直接登录。' : '使用你的完整邮箱地址和密码登录 TEMPO 邮箱。'}
             </Text>
           </View>
           <View style={[styles.form, { backgroundColor: theme.colors.surface }]}>
@@ -101,19 +114,25 @@ export default function Setup() {
               <TextInput style={styles.input} contentStyle={styles.inputContent} mode="flat" underlineColor="transparent" activeUnderlineColor="transparent" label="服务器地址" placeholder="https://mail.example.com" value={server} onChangeText={setServer} autoCapitalize="none" />
               <View style={[styles.separator, { backgroundColor: theme.colors.outlineVariant }]} />
             </>}
-            <TextInput autoFocus style={styles.input} contentStyle={styles.inputContent} mode="flat" underlineColor="transparent" activeUnderlineColor="transparent" label="邮箱地址" placeholder={custom ? 'name@example.com' : `name@${DEFAULT_MAIL_DOMAIN}`} value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" />
+            <TextInput autoFocus style={styles.input} contentStyle={styles.inputContent} mode="flat" underlineColor="transparent" activeUnderlineColor="transparent" label={registering ? '邮箱名' : '邮箱地址'} placeholder={registering ? `name（将创建 name@${DEFAULT_MAIL_DOMAIN}）` : custom ? 'name@example.com' : `name@${DEFAULT_MAIL_DOMAIN}`} value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType={registering ? 'default' : 'email-address'} />
             {custom && <>
               <View style={[styles.separator, { backgroundColor: theme.colors.outlineVariant }]} />
               <TextInput style={styles.input} contentStyle={styles.inputContent} mode="flat" underlineColor="transparent" activeUnderlineColor="transparent" label="登录用户名（可留空）" value={username} onChangeText={setUsername} autoCapitalize="none" />
             </>}
             <View style={[styles.separator, { backgroundColor: theme.colors.outlineVariant }]} />
             <TextInput style={styles.input} contentStyle={styles.inputContent} mode="flat" underlineColor="transparent" activeUnderlineColor="transparent" label="密码" value={password} onChangeText={setPassword} secureTextEntry />
+            {registering && <>
+              <View style={[styles.separator, { backgroundColor: theme.colors.outlineVariant }]} />
+              <TextInput style={styles.input} contentStyle={styles.inputContent} mode="flat" underlineColor="transparent" activeUnderlineColor="transparent" label="再次输入密码" value={confirmPassword} onChangeText={setConfirmPassword} secureTextEntry />
+              <View style={[styles.separator, { backgroundColor: theme.colors.outlineVariant }]} />
+              <TextInput style={styles.input} contentStyle={styles.inputContent} mode="flat" underlineColor="transparent" activeUnderlineColor="transparent" label="邀请码" value={inviteCode} onChangeText={setInviteCode} autoCapitalize="characters" />
+            </>}
           </View>
           {Boolean(error) && <HelperText type="error" visible style={styles.helper}>{error}</HelperText>}
           <View style={styles.actions}>
-            <NativeGlassButton label={busy ? '正在登录…' : '登录'} systemImage="arrow.right" prominent wide isDisabled={(custom && !server) || !email || !password || busy} onPress={() => void submit()} />
+            <NativeGlassButton label={busy ? (registering ? '正在创建…' : '正在登录…') : (registering ? '创建并登录' : '登录')} systemImage="arrow.right" prominent wide isDisabled={(custom && !server) || !email || !password || (registering && (!confirmPassword || !inviteCode)) || busy} onPress={() => void (registering ? register() : submit())} />
           </View>
-          {!custom && <Pressable accessibilityRole="button" hitSlop={12} onPress={() => changeMode('custom')} style={styles.textAction}>
+          {!custom && !registering && <Pressable accessibilityRole="button" hitSlop={12} onPress={() => changeMode('custom')} style={styles.textAction}>
             <Text variant="labelLarge" style={{ color: theme.colors.onBackground }}>使用自定义服务器</Text>
           </Pressable>}
         </ScrollView>

@@ -1,0 +1,34 @@
+networks:
+  1panel-network:
+    external: true
+
+services:
+  stalwart-mail:
+    container_name: ${CONTAINER_NAME}
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPUS}
+          memory: ${MEMORY_LIMIT}
+    image: stalwartlabs/stalwart:v0.16.25-alpine
+    env_file:
+      - ./recovery.env
+    labels:
+      createdBy: Apps
+    networks:
+      - 1panel-network
+    ports:
+      - ${HOST_IP}:${PANEL_APP_PORT_HTTPS}:443
+      - ${HOST_IP}:${PANEL_APP_PORT_HTTP}:8080
+      - ${HOST_IP}:${PORT_SMTP}:25
+      - ${HOST_IP}:${PORT_SMTP_SUBMISSION}:587
+      - ${HOST_IP}:${PORT_SMTP_SSL}:465
+      - ${HOST_IP}:${PORT_IMAP}:143
+      - ${HOST_IP}:${PORT_IMAP_SSL}:993
+      - ${HOST_IP}:${PORT_POP3}:110
+      - ${HOST_IP}:${PORT_POP3_SSL}:995
+      - ${HOST_IP}:${PORT_MANAGESIEVE}:4190
+    restart: always
+    volumes:
+      - ./data/config:/etc/stalwart
+      - ./data/state:/var/lib/stalwart
